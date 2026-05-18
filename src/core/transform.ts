@@ -66,6 +66,10 @@ export interface TransformInfo {
   dynamicChars: number;
   /** Number of dynamic blocks detected (<env>, <context>, etc.). */
   dynamicBlockCount: number;
+  /** Tag-shaped blocks found in the *static* slab that are NOT in
+   *  DYNAMIC_BLOCK_TAGS. Early-warning canary: if Claude Code ships a new
+   *  per-turn tag, it'll show up here before our cache hit rate collapses. */
+  unknownStaticTags?: string[];
   /** Parsed env block, if Claude Code injected one. Useful for telemetry
    *  (per-project compression ratios, etc.). */
   env?: EnvFields;
@@ -119,8 +123,10 @@ function splitStaticDynamic(text: string): {
   staticText: string;
   dynamicText: string;
   blockCount: number;
+  unknownTags: string[];
 } {
-  if (!text) return { staticText: '', dynamicText: '', blockCount: 0 };
+  if (!text)
+    return { staticText: '', dynamicText: '', blockCount: 0, unknownTags: [] };
   // Match <tag ...?>...</tag> where tag ∈ DYNAMIC_BLOCK_TAGS. Closing tag
   // must match opening tag exactly. Non-greedy body — earliest close wins.
   const pattern = new RegExp(
@@ -137,11 +143,27 @@ function splitStaticDynamic(text: string): {
     cursor = m.index + m[0].length;
   }
   staticBuf += text.slice(cursor);
+
+  // Sniff for OTHER tag-shaped blocks in the static slab. If Claude Code
+  // ships a new per-turn tag (say <recent_files>...</recent_files>) we'd
+  // silently bake it into the cached image and our cache hit rate would
+  // collapse. Surfacing the tag name as telemetry lets us detect that
+  // within hours of a Claude Code release.
+  const known = new Set<string>(DYNAMIC_BLOCK_TAGS);
+  const sniffer = /<([a-zA-Z][a-zA-Z0-9_-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g;
+  const unknown = new Set<string>();
+  let s: RegExpExecArray | null;
+  while ((s = sniffer.exec(staticBuf)) !== null) {
+    const tag = s[1]!;
+    if (!known.has(tag) && tag.length <= 64) unknown.add(tag);
+  }
+
   return {
     // Collapse the run of blank lines left behind by removed blocks.
     staticText: staticBuf.replace(/\n{3,}/g, '\n\n').trim(),
     dynamicText: dynamicParts.join('\n\n'),
     blockCount: dynamicParts.length,
+    unknownTags: [...unknown],
   };
 }
 
@@ -319,10 +341,16 @@ export async function transformRequest(
   //    - staticText: everything else (cacheable, goes into the image).
   const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
   const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
-  const { staticText, dynamicText, blockCount: dynBlocks } = splitStaticDynamic(sysBody);
+  const {
+    staticText,
+    dynamicText,
+    blockCount: dynBlocks,
+    unknownTags,
+  } = splitStaticDynamic(sysBody);
   info.staticChars = staticText.length;
   info.dynamicChars = dynamicText.length;
   info.dynamicBlockCount = dynBlocks;
+  if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
   // Parse env fields out of the dynamic slab — telemetry only, never mutates.
   const env = extractEnvFields(dynamicText);
   if (Object.keys(env).length > 0) info.env = env;

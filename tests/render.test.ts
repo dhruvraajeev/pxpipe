@@ -255,6 +255,72 @@ describe('transform', () => {
     expect(info.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
   });
 
+  it('renders identical input to byte-identical output (determinism = cacheability)', async () => {
+    // The whole token-savings story collapses if the renderer is non-
+    // deterministic, because identical system prompts on consecutive turns
+    // would produce different image bytes → 0% cache hit. Guard rail.
+    const sys = 'claude.md\n'.repeat(500);
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'hi' }],
+        system: sys,
+      }),
+    );
+    const a = await transformRequest(body);
+    const b = await transformRequest(
+      new TextEncoder().encode(
+        JSON.stringify({
+          model: 'claude',
+          messages: [{ role: 'user', content: 'hi' }],
+          system: sys,
+        }),
+      ),
+    );
+    // Compare image PNG bytes only — the request envelope wraps the same
+    // bytes but JSON ordering is deterministic too, so the whole body should
+    // match.
+    const sa = JSON.parse(new TextDecoder().decode(a.body)).system as any[];
+    const sb = JSON.parse(new TextDecoder().decode(b.body)).system as any[];
+    const imgsA = sa.filter((x: any) => x.type === 'image').map((x: any) => x.source.data);
+    const imgsB = sb.filter((x: any) => x.type === 'image').map((x: any) => x.source.data);
+    expect(imgsA.length).toBeGreaterThan(0);
+    expect(imgsA).toEqual(imgsB);
+    expect(a.info.systemSha8).toBe(b.info.systemSha8);
+  });
+
+  it('flags unknown tag-shaped blocks in the static slab (canary for new dynamic tags)', async () => {
+    const sys =
+      'claude.md\n'.repeat(400) +
+      '<recent_files>\nfoo.ts\nbar.ts\n</recent_files>\n' +
+      "<env>\nWorking directory: /tmp\n</env>";
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'hi' }],
+        system: sys,
+      }),
+    );
+    const { info } = await transformRequest(body);
+    expect(info.unknownStaticTags).toBeDefined();
+    expect(info.unknownStaticTags).toContain('recent_files');
+    // <env> is known, must NOT appear here.
+    expect(info.unknownStaticTags).not.toContain('env');
+  });
+
+  it('omits unknownStaticTags when the static slab has no tag-shaped blocks', async () => {
+    const sys = 'claude.md\n'.repeat(400) + '<env>\nWorking directory: /tmp\n</env>';
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'hi' }],
+        system: sys,
+      }),
+    );
+    const { info } = await transformRequest(body);
+    expect(info.unknownStaticTags).toBeUndefined();
+  });
+
   it('passes through when the system prompt is only dynamic blocks', async () => {
     const sys = '<env>\nWorking directory: /tmp\n</env>';
     const body = new TextEncoder().encode(
