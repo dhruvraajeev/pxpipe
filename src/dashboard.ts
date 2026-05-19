@@ -99,8 +99,17 @@ interface Totals {
  *  See /tmp/pixelpipe-history-compression.md for the analysis. */
 const OPUS_IMAGE_TOKEN_COST = 2500;
 
-/** Estimated token cost of the N images we emit per compressed request. */
-function estImageTokens(imageCount: number): number {
+/** Estimated token cost of the N images we emit per compressed request.
+ *  When the dashboard has accumulated ≥3 cold-miss samples with the new
+ *  instrumentation, prefer `imagePixels × β` (live empirical rate) over
+ *  the stale flat constant — the constant was measured on Opus pre-4.7
+ *  with single-col 508×1559 PNGs, and is wrong by ~3× under multi-col 2. */
+function estImageTokens(
+  imageCount: number,
+  imagePixels: number,
+  beta: number | null,
+): number {
+  if (beta !== null && imagePixels > 0) return Math.round(imagePixels * beta);
   return imageCount * OPUS_IMAGE_TOKEN_COST;
 }
 
@@ -131,16 +140,27 @@ function baselineCost(
   actualEff: number,
   compressedChars: number,
   imageCount: number,
+  imagePixels: number,
   cacheCreate: number,
   cacheRead: number,
+  fit: { alpha: number; beta: number } | null,
 ): number {
   // compressedChars is the actual text we IMAGE-encoded (static slab +
   // reminders + tool_results that passed the break-even gate). NOT the
   // total origChars — that would include text-only blocks that stayed
   // as text and wouldn't have appeared as `imageCount` either, making
   // the apples-to-apples comparison invalid.
-  const txtReplaced = Math.floor(compressedChars / 4); // ~4 chars per token
-  const imgTokensEst = estImageTokens(imageCount);
+  //
+  // When `fit` is non-null we have ≥3 cold-miss samples and trust the
+  // measured rates: txtReplaced = compressedChars × α (tokens-per-char),
+  // imgTokens = imagePixels × β (tokens-per-pixel). When `fit` is null
+  // we fall back to the stale 4-chars-per-token + 2500-tokens-per-image
+  // constants, which are still in the right ballpark for Opus pre-4.7
+  // single-col workloads.
+  const txtReplaced = fit
+    ? Math.floor(compressedChars * fit.alpha)
+    : Math.floor(compressedChars / 4);
+  const imgTokensEst = estImageTokens(imageCount, imagePixels, fit ? fit.beta : null);
   // extraText CAN be negative when image cost > text cost. Don't clamp —
   // surfaces honest negatives so the operator can see cost-bleed.
   const extraText = txtReplaced - imgTokensEst;
@@ -150,8 +170,30 @@ function baselineCost(
   return actualEff + extraText * baselineRate;
 }
 
+/** One sample for the empirical cost regression. Built from cold-miss
+ *  events (cache_read=0, cache_create>1000) where the new instrumentation
+ *  (`image_pixels`, `outgoing_text_chars`) is present.
+ *
+ *  Solves: `tokens ≈ α · text_chars + β · pixels` over N samples via 2×2
+ *  normal equations. Surfaced live in `/proxy-stats` so the dashboard
+ *  shows the empirical chars/token and tokens/image numbers as soon as
+ *  enough cold-miss data accumulates — replaces the one-shot script that
+ *  nobody would ever remember to run. */
+interface ColdMissSample {
+  tokens: number;
+  text_chars: number;
+  pixels: number;
+}
+
+/** Cap for the cold-miss ring. Fits get noisier with more old data after a
+ *  model change, so we keep it short — enough samples for a stable fit
+ *  (N≥10 typical) but young enough that a flipped MULTI_COL or model upgrade
+ *  flushes through within a few sessions. */
+const COLD_MISS_CAP = 50;
+
 export class DashboardState {
   private recent: RecentRow[] = [];
+  private coldMisses: ColdMissSample[] = [];
   private totals: Totals = {
     requests: 0,
     compressedRequests: 0,
@@ -213,9 +255,24 @@ export class DashboardState {
     const haveUsage = u !== undefined && (inp > 0 || out > 0 || cc > 0 || cr > 0);
 
     const eff = haveUsage ? effectiveCost(inp, cc, cr) : 0;
+    // Pull the current empirical fit BEFORE recording — when this event is
+    // itself a cold miss it'll feed back into the next request's fit, but
+    // for this baseline calc we use whatever rate we have so far. Null
+    // until ≥3 cold-miss samples accumulate; baselineCost falls back to
+    // the stale constants in that case.
+    const fit = this.fitCosts();
+    const imgPx = (info as { imagePixels?: number } | undefined)?.imagePixels ?? 0;
     const baselineEff =
       haveUsage && compressed
-        ? baselineCost(eff, info?.compressedChars ?? 0, info?.imageCount ?? 0, cc, cr)
+        ? baselineCost(
+            eff,
+            info?.compressedChars ?? 0,
+            info?.imageCount ?? 0,
+            imgPx,
+            cc,
+            cr,
+            fit ? { alpha: fit.alpha, beta: fit.beta } : null,
+          )
         : eff;
 
     const prevSaved = this.totals.effectiveInputBaselineEst - this.totals.effectiveInputActual;
@@ -232,7 +289,9 @@ export class DashboardState {
       status: ev.status,
       compressed,
       cc_added: compressed ? 1 : undefined, // we always emit exactly one cache_control
-      expected_image_tokens: compressed ? estImageTokens(info?.imageCount ?? 0) : undefined,
+      expected_image_tokens: compressed
+        ? estImageTokens(info?.imageCount ?? 0, imgPx, fit ? fit.beta : null)
+        : undefined,
       input_tokens: haveUsage ? inp : undefined,
       cache_create: haveUsage ? cc : undefined,
       cache_read: haveUsage ? cr : undefined,
@@ -242,6 +301,73 @@ export class DashboardState {
     };
     this.recent.push(row);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
+
+    // Cold-miss sample for the empirical cost regression. Requires the new
+    // pair of measurements (image_pixels + outgoing_text_chars) to be
+    // present, and the usage numbers to show a true cold miss (cache_read=0,
+    // cache_create>1000 — the latter filters out tiny no-system requests).
+    const pixels = (info as { imagePixels?: number } | undefined)?.imagePixels;
+    const textChars = (info as { outgoingTextChars?: number } | undefined)?.outgoingTextChars;
+    if (
+      compressed &&
+      haveUsage &&
+      cr === 0 &&
+      cc > 1000 &&
+      typeof pixels === 'number' &&
+      pixels > 0 &&
+      typeof textChars === 'number' &&
+      textChars > 0
+    ) {
+      this.coldMisses.push({ tokens: inp + cc, text_chars: textChars, pixels });
+      if (this.coldMisses.length > COLD_MISS_CAP) {
+        this.coldMisses.splice(0, this.coldMisses.length - COLD_MISS_CAP);
+      }
+    }
+  }
+
+  /** Solve the empirical cost regression over the current cold-miss ring.
+   *  Returns `null` until we have at least 3 samples — fewer leaves the
+   *  2×2 normal equations under-determined and the fit jumps around with
+   *  every new event, which would be worse than just showing nothing. */
+  fitCosts(): {
+    alpha: number;
+    beta: number;
+    chars_per_token: number;
+    pixels_per_token: number;
+    single_col_tokens_per_img: number;
+    multicol2_tokens_per_img: number;
+    n: number;
+  } | null {
+    const samples = this.coldMisses;
+    if (samples.length < 3) return null;
+    let sxx = 0;
+    let sxy = 0;
+    let syy = 0;
+    let sxt = 0;
+    let syt = 0;
+    for (const s of samples) {
+      sxx += s.text_chars * s.text_chars;
+      sxy += s.text_chars * s.pixels;
+      syy += s.pixels * s.pixels;
+      sxt += s.text_chars * s.tokens;
+      syt += s.pixels * s.tokens;
+    }
+    const det = sxx * syy - sxy * sxy;
+    if (det === 0) return null; // collinear, can't separate the two effects
+    const alpha = (syy * sxt - sxy * syt) / det;
+    const beta = (sxx * syt - sxy * sxt) / det;
+    // Guard against degenerate fits (negative rates mean the data is too
+    // noisy / multi-modal to give a clean linear answer).
+    if (alpha <= 0 || beta <= 0) return null;
+    return {
+      alpha: round4(alpha),
+      beta: round4(beta * 1000) / 1000, // β is tiny — keep 6 sig figs effectively
+      chars_per_token: round1(1 / alpha),
+      pixels_per_token: Math.round(1 / beta),
+      single_col_tokens_per_img: Math.round(508 * 1559 * beta),
+      multicol2_tokens_per_img: Math.round(1028 * 1559 * beta),
+      n: samples.length,
+    };
   }
 
   /** On startup, fold the last N entries from the JSONL events file back
@@ -275,8 +401,13 @@ export class DashboardState {
         status: t.status,
         compressed: t.compressed === true,
         cc_added: t.compressed === true ? 1 : undefined,
+        // Replay path uses the FIT-LESS form: historical rows don't get
+        // re-scored as the live fit evolves. Only fresh events flowing
+        // through record() benefit from the empirical rates.
         expected_image_tokens:
-          t.compressed === true ? estImageTokens(t.image_count ?? 0) : undefined,
+          t.compressed === true
+            ? estImageTokens(t.image_count ?? 0, (t as { image_pixels?: number }).image_pixels ?? 0, null)
+            : undefined,
         input_tokens: t.input_tokens,
         cache_create: t.cache_create_tokens,
         cache_read: t.cache_read_tokens,
@@ -292,6 +423,14 @@ export class DashboardState {
             : undefined,
       };
       this.recent.push(row);
+      // DELIBERATELY do NOT seed the cold-miss ring from historical events.
+      // Old events may carry the new instrumentation but come from a
+      // different renderer config (cell size, multiCol, atlas profile) or
+      // a different model (Opus 4.6 vs 4.7 tokenizer). Mixing them into the
+      // fit gives a misleading α/β that lags behind reality. Each restart
+      // starts the fit window empty and refills from live traffic — this
+      // way flipping `multiCol`, bumping the cell size, or upgrading to a
+      // new model auto-flushes stale samples on the next restart.
     }
   }
 
@@ -313,6 +452,12 @@ export class DashboardState {
       saved_pct: round1(pct),
       saved_usd_opus47: round4((saved * 15.0) / 1e6),
       uptime_sec: uptimeSec,
+      // Empirical cost fit — null until ≥3 cold-miss events with the new
+      // instrumentation accumulate. When present, contains the live model's
+      // chars/token and per-image-shape token cost so the dashboard can
+      // re-ground its stale 2,500/img and 4-chars/tok constants from data
+      // instead of guessing.
+      cost_fit: this.fitCosts(),
     };
     return new Response(JSON.stringify(payload, null, 2), {
       headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
