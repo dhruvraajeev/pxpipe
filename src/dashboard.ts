@@ -838,10 +838,10 @@ export class DashboardState {
       saved_pct_high: round1(pctHigh),
       // Ground-truth measurement path. Populated ONLY when ≥1 event
       // carried both baseline_tokens_measured AND actual_tokens_measured
-      // (i.e. the proxy ran with measureSavings=true). No estimation:
+      // (i.e. count_tokens succeeded on both probes). No estimation:
       // saved_pct_measured = (baseline_measured - actual_measured) / baseline_measured.
-      // When non-null, the HTML headline switches to display these instead
-      // of the regression estimate.
+      // When non-null, the HTML headline displays these instead of the
+      // regression estimate.
       measured_events: this.totals.measuredEvents,
       effective_cost_actual_measured:
         this.totals.measuredEvents > 0 ? round1(this.totals.effectiveCostActualMeasured) : null,
@@ -1265,12 +1265,11 @@ async function tick() {
     }
     // Headline priority:
     //   1. Ground-truth measured saved_pct (count_tokens on both bodies) —
-    //      no estimation, exact tokenizer output. Shown when measureSavings
-    //      is enabled in the proxy and ≥1 event has both measurements.
-    //   2. Otherwise, honest uncertainty range from per-sample α p10/p90.
-    //      When spread ≥5pp we show the range INSTEAD of the point
-    //      estimate (range tells the operator α isn't sharp enough to
-    //      promise a single number); tight spread collapses to the point.
+    //      no estimation, exact tokenizer output. Shown when ≥1 event has
+    //      both measurements (the count_tokens probes are unconditional).
+    //   2. Otherwise (every probe failed so far), honest uncertainty range
+    //      from per-sample α p10/p90. When spread ≥5pp we show the range
+    //      INSTEAD of the point estimate; tight spread collapses to point.
     const haveMeasured =
       typeof s.saved_pct_measured === 'number' && (s.measured_events ?? 0) > 0;
     if (haveMeasured) {

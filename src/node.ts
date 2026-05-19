@@ -49,13 +49,6 @@ interface CliOpts {
   track: boolean;
   /** Where to append JSONL events. Default ~/.pixelpipe/events.jsonl. */
   eventsFile: string;
-  /** When true, call Anthropic's /v1/messages/count_tokens on BOTH the pre-
-   *  and post-transform bodies for every /v1/messages request. The exact
-   *  tokenizer counts populate info.{baselineTokensMeasured,
-   *  actualTokensMeasured}, and the dashboard reports saved_pct from
-   *  ground truth rather than the α/β regression. Adds two parallel HTTP
-   *  roundtrips per request; count_tokens itself is free. Default false. */
-  measureSavings: boolean;
 }
 
 function envFlag(name: string, fallback: boolean): boolean {
@@ -95,7 +88,6 @@ function parseCli(argv: string[]): CliOpts {
     eventsFile:
       process.env.PIXELPIPE_LOG ??
       path.join(os.homedir(), '.pixelpipe', 'events.jsonl'),
-    measureSavings: envFlag('PIXELPIPE_MEASURE_SAVINGS', false),
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -120,7 +112,6 @@ function parseCli(argv: string[]): CliOpts {
       case '--multi-col':      o.multiCol = Math.max(1, Number(eat()) | 0); break;
       case '--no-track':       o.track = false; break;
       case '--events-file':    o.eventsFile = eat(); break;
-      case '--measure-savings': o.measureSavings = true; break;
       case '-h':
       case '--help':           printHelp(); process.exit(0);
       case '--version':        printVersion(); process.exit(0);
@@ -159,12 +150,6 @@ Options:
                           set to 1 to disable. Higher N may exceed the
                           1568px image-width cap and gets clamped.)
       --no-track          disable persistent event tracking
-      --measure-savings   call /v1/messages/count_tokens on both pre- and
-                          post-transform bodies per request, populating
-                          baseline_tokens_measured + actual_tokens_measured.
-                          Dashboard then shows GROUND-TRUTH saved_pct.
-                          Adds 2 parallel roundtrips per request; free.
-                          Also via PIXELPIPE_MEASURE_SAVINGS=1.
       --events-file <P>   JSONL events path (default ~/.pixelpipe/events.jsonl)
   -h, --help              show this help
       --version           show version
@@ -530,7 +515,6 @@ async function main(): Promise<void> {
 
   const config: ProxyConfig = {
     upstream: opts.upstream,
-    measureSavings: opts.measureSavings,
     // Resolve transform options per request so the live empirical
     // chars/token from dashboardState.fitCosts() flows into the
     // isCompressionProfitable gate. With α at the stale default of 0.25

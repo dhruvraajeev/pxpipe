@@ -45,9 +45,9 @@ export interface TrackEvent {
    *  for the live model. */
   outgoing_text_chars?: number;
   /** Ground-truth pre-transform token count from Anthropic's
-   *  /v1/messages/count_tokens. Populated only when the host enabled the
-   *  measureSavings flag. Together with `actual_tokens_measured` this
-   *  gives exact saved_pct without any α/β estimation. */
+   *  /v1/messages/count_tokens. Together with `actual_tokens_measured`
+   *  this gives exact saved_pct without any α/β estimation. Absent on
+   *  rows where the count_tokens upstream call failed. */
   baseline_tokens_measured?: number;
   /** Ground-truth post-transform token count from count_tokens. */
   actual_tokens_measured?: number;

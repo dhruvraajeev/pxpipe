@@ -21,15 +21,6 @@ export interface ProxyConfig {
    *  /v1/messages POST. Static object form is used by the Workers host and
    *  tests that don't need dynamic state. */
   transform?: TransformOptions | (() => TransformOptions);
-  /** When true, the proxy fires a /v1/messages/count_tokens call on BOTH
-   *  the pre-transform body and the post-transform body for every
-   *  /v1/messages request, and attaches the exact tokenizer counts to
-   *  `info.baselineTokensMeasured` and `info.actualTokensMeasured`. The
-   *  dashboard's headline saved_pct then comes from real measurement
-   *  rather than the α/β regression. count_tokens is free (Anthropic
-   *  doesn't bill it) but adds two parallel HTTP roundtrips per request,
-   *  so this is opt-in. Default false. */
-  measureSavings?: boolean;
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
 }
@@ -375,11 +366,11 @@ export function createProxy(config: ProxyConfig = {}) {
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
 
-    // Ground-truth token-count measurement (opt-in via config.measureSavings).
-    // When enabled, we fire /v1/messages/count_tokens on the pre-transform
-    // and post-transform bodies in parallel with the main upstream forward.
-    // Results land on info.{baselineTokensMeasured, actualTokensMeasured}
-    // and the dashboard prefers them over the α-regression estimate.
+    // Ground-truth token-count measurement. Fires /v1/messages/count_tokens
+    // on the pre-transform and post-transform bodies in parallel with the
+    // main upstream forward. Results land on info.{baselineTokensMeasured,
+    // actualTokensMeasured} and the dashboard reports the real saved_pct
+    // from these exact numbers — no α/β estimation.
     let measurePromise: Promise<{
       baseline: number | null;
       actual: number | null;
@@ -408,16 +399,15 @@ export function createProxy(config: ProxyConfig = {}) {
 
         // Kick off the two count_tokens probes BEFORE forwarding /v1/messages
         // so they run in parallel with the main request. Headers are filtered
-        // exactly like the main request — same auth, same model, same anthropic-
-        // version. Both calls are no-ops if measureSavings is disabled.
-        if (config.measureSavings) {
-          const ctHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-          if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
-          measurePromise = Promise.all([
-            countTokensUpstream(upstream, bodyIn, ctHeaders),
-            countTokensUpstream(upstream, r.body as unknown as BodyInit, ctHeaders),
-          ]).then(([baseline, actual]) => ({ baseline, actual }));
-        }
+        // exactly like the main request — same auth, same model, same
+        // anthropic-version. Failure is silent: a null result drops the
+        // measurement on this event without affecting the forwarded response.
+        const ctHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
+        if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+        measurePromise = Promise.all([
+          countTokensUpstream(upstream, bodyIn, ctHeaders),
+          countTokensUpstream(upstream, r.body as unknown as BodyInit, ctHeaders),
+        ]).then(([baseline, actual]) => ({ baseline, actual }));
       } catch (e) {
         fire(502, undefined, `transform_error: ${(e as Error).message}`);
         return new Response(JSON.stringify({ error: 'pixelpipe transform failed' }), {
