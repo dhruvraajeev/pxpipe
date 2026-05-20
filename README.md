@@ -1,15 +1,40 @@
 # pixelpipe
 
-A token-saving proxy for Claude Code that renders the system prompt + tool
-definitions as images, so Claude OCRs them instead of paying for them as
-text. **65-73% input-token savings** on Opus 4.7, **100% reasoning quality**
-preserved, **identical fixed text** every turn for a clean prompt-cache.
+**Make Opus see pixels instead of tokens.**
+
+A proxy for Claude Code that intercepts `POST /v1/messages` and renders
+the bulky text inputs as grayscale PNGs, letting Anthropic's vision
+stack OCR them on the way in. The inputs we touch:
+
+- **`system` field** — Claude Code's base system prompt + `CLAUDE.md`
+  project instructions + every loaded **skill**'s SKILL.md + agent
+  definitions. Identical every turn, ~tens of KB on its own.
+- **`tools` field** — every built-in tool schema (Bash, Read, Edit,
+  Grep, Task, …) plus every **MCP server**'s tool definitions. Each
+  MCP server you wire up (Gmail, Calendar, Drive, custom servers) adds
+  its full tool list here. This is usually the biggest single bucket.
+- **closed-prefix `tool_use` / `tool_result` history** — turns past the
+  4-breakpoint cache cliff that can't cache anymore, collapsed into one
+  synthetic prepended `user` message + PNG.
+- **large `tool_result` blocks** in the live tail (long file reads, big
+  bash outputs, MCP responses) that pass a per-block break-even check.
+- **large `<system-reminder>` blocks** inside user messages — Claude
+  Code injects these for things like task-tracker state, file-state
+  hints, and skill discovery; they grow with session length.
+
+What we leave as text: the recent live turns, anything under the
+break-even threshold, and the dynamic per-turn variable section
+(suppressed via Claude Code's `--exclude-dynamic-system-prompt-sections`
+flag so the cached image stays byte-identical).
+
+One measured cold-miss event went from **173,783** input tokens to
+**41,321** `cache_create` tokens (~76% fewer tokens billed, ~70% in
+dollars after the 1.25× `cache_create` premium). Warm hits get a
+smaller margin because both paths pay 0.1× `cache_read`. **100%
+reasoning quality preserved**, **byte-identical fixed text** every turn
+for a clean prompt-cache hit.
 
 Runs on **Node 18+** and **Cloudflare Workers** from the same source.
-
----
-
-## How it works
 
 ```
                                   ┌─ original ────────────────────┐
@@ -25,22 +50,199 @@ Claude Code  ──►  pixelpipe  ──►  │  (system + tools as text)     
                                           100% reasoning quality retained
 ```
 
+---
+
+## Why it works (the math)
+
 The proxy intercepts `POST /v1/messages`, pulls the system prompt + tool
 documentation out of the JSON body, renders it into one or more grayscale
-PNGs using a build-time-generated GNU Unifont glyph atlas (covers ~35k
-BMP codepoints by default — Latin, Cyrillic, Greek, CJK, Hiragana,
-Katakana, Hangul, Hebrew, Arabic, math symbols, box drawing, decorative
-symbols), and substitutes those PNGs back in as `image` content blocks
-with an `ephemeral` cache_control breakpoint.
+PNGs using a build-time-generated GNU Unifont glyph atlas (~35k BMP
+codepoints by default — Latin, Cyrillic, Greek, CJK, Hiragana, Katakana,
+Hangul, Hebrew, Arabic, math symbols, box drawing, decorative symbols),
+and substitutes those PNGs back in as `image` content blocks with an
+`ephemeral` `cache_control` breakpoint.
 
-Token math (Opus 4.7, real Claude Code workflow):
+Three independent derivations, each anchored on a number you can verify
+against the source.
 
-| metric                       | original | via proxy   | savings |
-| ---------------------------- | -------- | ----------- | ------- |
-| Cold input tokens            | ~68K     | ~3.5K       | 95%     |
-| Cache-warm input tokens      | ~7.5K    | ~3.5K       | 53%     |
-| Per-call median (mixed)      | -        | -           | 65-73%  |
-| Per-image OCR quality vs txt | -        | -           | ~99.5%  |
+### Step 1 — image → tokens
+
+Anthropic bills images by area
+([Vision docs](https://docs.anthropic.com/en/docs/build-with-claude/vision)):
+
+```
+image_tokens ≈ (width × height) / 750
+```
+
+Pixelpipe ships 508×1559 PNGs, so the textbook estimate is:
+
+```
+508 × 1559 / 750 ≈ 1,056 tokens/image
+```
+
+Real `count_tokens` probes against those PNGs measure ≈ **5,500 tokens/image**
+at `multiCol=2` — a 5× gap that the renderer accounts for via the empirical
+`effectiveTokensPerImage(numCols)` constant in `src/core/transform.ts`.
+The textbook formula is the lower bound; the empirical number is what gets
+billed.
+
+### Step 2 — text → tokens
+
+The "English prose ≈ 4 chars/token" rule from Anthropic's
+[pricing docs](https://docs.anthropic.com/en/docs/about-claude/pricing)
+does not survive contact with real Claude Code traffic. Across N=354
+production `count_tokens` probes on real `/v1/messages` bodies:
+
+```
+median  1.17 chars/token
+p75     1.19 chars/token
+p95     2.50 chars/token
+max     2.62 chars/token
+```
+
+Real bodies are JSON-dense — tool definitions, schemas, structured
+`CLAUDE.md` slabs, `tool_result` blocks — which tokenize 2-4× denser than
+prose. The gate `isCompressionProfitable()` uses
+`SLAB_CHARS_PER_TOKEN = 2.5` at the slab call site (the 95th percentile of
+observed real cpt with a small safety margin), so it only compresses when
+the text actually costs more tokens than the image will. At the textbook
+4 ch/tok the gate silently rejects every realistic slab as
+`not_profitable` — that bug is what motivates the constant.
+
+### Step 3 — tokens → $
+
+Rates from [Anthropic's pricing page](https://www.anthropic.com/pricing).
+Image tokens are billed at the input rate. Input price has been flat
+across Opus 4.5/4.6/4.7 — the proxy's value scales with input volume, not
+model version.
+
+| line item            | rate (Opus 4)  | rate (Opus 4.5+) |
+| -------------------- | -------------- | ---------------- |
+| input                | $15.00 / MTok  | $5.00 / MTok     |
+| output               | $75.00 / MTok  | $25.00 / MTok    |
+| cache_create (5 min) | $18.75 / MTok  | $6.25 / MTok     |
+| cache_read           | $ 1.50 / MTok  | $0.50 / MTok     |
+
+### Worked example — one real cold-miss event
+
+From `events.jsonl`, 2026-05-20T12:30:01 (a fresh session, 161,101-char
+system slab + 37 images-worth of accumulated history):
+
+```
+orig_chars             161,101    system + tool docs slab
+image_count                 37
+baseline_tokens        173,783    count_tokens probe of the unproxied
+                                  body — what Anthropic would have
+                                  billed without the proxy
+cache_create_tokens     41,321    what actually got billed via pixelpipe
+cache_read_tokens            0    cold miss
+```
+
+Byte reduction on the cold miss: **76%** (173,783 → 41,321 tokens). Same
+event, run later in the session (11:53:06, warm hit on the cached PNGs):
+
+```
+baseline_tokens        168,707
+cache_create_tokens        111    only the per-turn dynamic delta
+cache_read_tokens      140,786    paid at 0.1× the input rate
+```
+
+The cold-miss savings are large because the proxy shrinks what gets
+cached. Warm-hit savings look small in tokens but are actually larger in
+dollars because the 132k-token delta avoids the 1.25× cache_create
+premium and instead pays the 0.1× cache_read price.
+
+| metric                       | original | via proxy | savings  |
+| ---------------------------- | -------- | --------- | -------- |
+| Cold input tokens (per call) | ~174k    | ~41k      | ~76%     |
+| Cache-warm input tokens      | ~169k    | ~141k     | ~17%     |
+| Per-image OCR quality vs txt | -        | -         | ~99.5%   |
+
+---
+
+## Why it's hard (the parts that bite)
+
+Most of the engineering in this repo is not "render text to PNG." That
+part is a build-time atlas and a `Uint8Array` blit. The hard parts are
+all about *what is safe to compress, when, and at what cost.*
+
+**Prompt caching changes the question.** Anthropic's cache writes cost
+**1.25× normal input** (`cache_create`), reads cost **0.1×**
+(`cache_read`), the TTL is **5 minutes**, you get **4 breakpoints** per
+request, and **any change to prefixed content invalidates everything
+downstream.** A naive "compress everything" proxy would *lose* money on
+warm requests where 90% of the slab was already cached at 10% billing —
+the image still costs its full ~5,500 tokens at `cache_create` price the
+first time it's seen. The proxy stays a win because (a) the image's
+`cache_create` is still 95%+ cheaper than the text's `cache_create`, and
+(b) Claude Code sessions are bursty: 5-15 min coding bursts separated by
+lunch / meetings / context-switching hit cache expiry constantly. Every
+~5 min idle = a fresh cold miss = the 1.25× tax re-paid on the full
+uncompressed slab. **Cache expiry argues *for* compression, not against
+it** — the tax stays the same, the base shrinks.
+
+**The static slab is mostly free; the real headroom is dynamic.** Once
+the system prompt + tool definitions are cached, they bill at 10% on
+every warm turn. That's where Anthropic's "just use the cache" guidance
+ends. But Claude Code's `tool_result` blocks change every turn, never
+cache, and pay full freight every single turn — a 30k `tool_result` × 10
+turns = 300k uncached tokens billed at 100%, *bigger than the slab fix.*
+History compression (Variant C) addresses the other side: long sessions
+push older turns out of the 4-breakpoint cache budget, so a 50-turn
+session with 30 turns of `tool_result`s pays 600k tokens of uncached,
+repeat-billed text on every turn. Collapsing those into one synthetic
+prepended user message + PNG is the same shape of fix as the slab.
+
+**Assistant outputs and the model's thinking cannot be image-encoded.**
+This is a hard architectural constraint, not a tuning choice. The
+Anthropic Messages API only accepts `image` content blocks inside `user`
+messages — `assistant` turns are text-only by contract. And even if the
+API allowed it, the proxy never sees an assistant token until *after*
+the model has generated it; you can't render what hasn't been emitted
+yet. The same applies to extended-thinking blocks: they're produced by
+the model, billed as output, and round-tripped on subsequent turns as
+opaque assistant content. **Everything pixelpipe compresses is
+input-side, host-supplied, and known before the call.** That's why the
+two compression paths are (1) the static slab — system prompt + tool
+docs that Claude Code injects identically every turn — and (2) closed
+prefix history — user/tool_result turns that have already happened and
+will never change. Anything the model wrote, or will write, is off the
+table.
+
+**The break-even gate has to be honest about real text shape.** A 161k
+production slab was being silently rejected as `not_profitable` for
+weeks because the gate estimated text at the textbook 4 chars/token when
+the real density was 1.17. The gate's job is "compress if and only if
+doing so saves tokens" — if the constant is too low we miss profitable
+compressions, if it's too high we accept money-losers. The fix wasn't a
+flag; it was wiring a `chars_per_token` value derived from a parallel
+`/v1/messages/count_tokens` probe into the call site that owns the
+decision. The same fix applied at the history call site unlocks
+`historyReason: "collapsed"` for long sessions.
+
+**Multi-column packing has an OCR cliff.** Two columns side-by-side
+double the per-image text capacity, but the renderer must guarantee
+Anthropic's vision stack reads column 1 fully top-to-bottom before
+column 2. Layouts with line lengths near 1568 px and a weak column
+divider can produce row-interleaved OCR output. The renderer adds a
+light-gray gutter divider, a per-image break-even check specifically
+for `multiCol=2` (image cost doubles, text savings double, but the 10%
+extrapolation margin on top of 2× = 5500 also doubles), and a global
+`multiCol: 2` default that can be overridden to 1 if OCR ordering ever
+turns out wrong on a specific deployment.
+
+**Telemetry is the only honest oracle.** Every constant in the gate —
+`SLAB_CHARS_PER_TOKEN`, `HISTORY_CHARS_PER_TOKEN`, `LINES_PER_IMAGE`,
+`TOKENS_PER_IMAGE_SINGLE_COL`, `effectiveTokensPerImage(numCols)` — has
+a comment pointing at the production probe that grounded it, with date
+and sample size. The proxy logs every request to `events.jsonl` with
+`baseline_tokens` (from a parallel cold `count_tokens` call),
+`cache_create_tokens`, `cache_read_tokens`, `orig_chars`, `image_count`,
+`image_pixels`, `outgoing_text_chars`, and (when history fires)
+`collapsed_turns`, `collapsed_chars`, `collapsed_images`. The dashboard
+at `/` regresses `total_tokens = α·outgoingTextChars + β·imagePixels`
+on every cold-miss event to keep the per-image cost estimate honest as
+the model and atlas evolve.
 
 ---
 
