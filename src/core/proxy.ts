@@ -55,6 +55,13 @@ export interface ProxyEvent {
    *  body to a sidecar file. The path lands in the JSONL as
    *  `req_body_sample_path`. */
   reqBodySamplePath?: string;
+  /** Ground-truth output measurement extracted from the response stream itself,
+   *  independent of Anthropic's `usage.output_tokens`. Lets the dashboard show
+   *  how much of the billed output was redacted_thinking (opaque server-encoded
+   *  bytes) vs real text/thinking/tool_use. Absent on requests that didn't
+   *  yield a body we could scan (no upstream response, 5xx, unknown
+   *  content-type). See OutputMeasurement for field meanings. */
+  measurement?: OutputMeasurement;
 }
 
 /** Max chars of upstream error body we surface on ProxyEvent. Keeps the JSONL
@@ -86,20 +93,142 @@ async function sha8Bytes(body: Uint8Array): Promise<string> {
 }
 
 /**
- * Tee the response body so we can scan for the usage block (SSE: in the
- * message_start event; non-stream: at the top of the JSON) without buffering
- * the whole stream or blocking the client. Returns the un-touched response
- * to forward to the client + a Promise that resolves to the parsed Usage
- * (or undefined if we couldn't find one within the budget).
+ * Ground-truth output measurement extracted from the response stream itself.
  *
- * For upstream 4xx responses, we instead tee the body to capture up to
- * `ERROR_BODY_MAX` chars so the host can log what Anthropic actually rejected.
- * 5xx still bails — those get our own synthesized error string upstream.
+ *  - `textChars` / `thinkingChars` / `toolUseChars` count Unicode code units
+ *    of the corresponding payload (`text_delta`, `thinking_delta`, and
+ *    `input_json_delta` for SSE; `content[].text` / `.thinking` /
+ *    JSON-encoded `.input` for non-stream responses).
+ *  - `redactedBlockCount` is the number of `redacted_thinking` content blocks
+ *    Anthropic returned — chars are unavailable for these (the field is
+ *    opaque server-encrypted bytes), so they get a low/mid/high estimate at
+ *    the dashboard layer instead of a precise char count.
+ *
+ * These numbers are independent of Anthropic's `usage.output_tokens` — they
+ * give us a real ruler against the redacted_thinking-inflated bill, which is
+ * exactly the gap the May-2026 weekly-meter audit surfaced. Live on `info`,
+ * so they ride the existing TrackEvent pipeline; the dashboard layer turns
+ * them into `output_chars_measured`, `tool_use_chars_measured`, etc.
+ */
+export interface OutputMeasurement {
+  textChars: number;
+  thinkingChars: number;
+  toolUseChars: number;
+  redactedBlockCount: number;
+}
+
+/** Walk a single SSE event (`event: …\ndata: …`) and fold it into the running
+ *  usage + measurement accumulators. Quiet on malformed events — a stream
+ *  with one corrupt line should not break the host's event log. */
+function processSseEvent(
+  block: string,
+  m: OutputMeasurement,
+  state: { usage: Usage | undefined },
+): void {
+  // Each SSE event is one or more lines; we only care about `event:` + `data:`.
+  // Continuation `data:` lines concatenate per the SSE spec, though Anthropic
+  // ships single-line JSON in practice.
+  let event = '';
+  let data = '';
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).replace(/^\s/, '');
+  }
+  if (!data) return;
+  let j: unknown;
+  try {
+    j = JSON.parse(data);
+  } catch {
+    return;
+  }
+  const obj = j as Record<string, unknown>;
+
+  if (event === 'message_start') {
+    const msg = obj.message as { usage?: Usage } | undefined;
+    if (msg?.usage) state.usage = { ...msg.usage };
+  } else if (event === 'content_block_start') {
+    const cb = obj.content_block as { type?: string } | undefined;
+    if (cb?.type === 'redacted_thinking') m.redactedBlockCount += 1;
+  } else if (event === 'content_block_delta') {
+    const d = obj.delta as
+      | { type?: string; text?: string; thinking?: string; partial_json?: string }
+      | undefined;
+    if (d?.type === 'text_delta' && typeof d.text === 'string') {
+      m.textChars += d.text.length;
+    } else if (d?.type === 'thinking_delta' && typeof d.thinking === 'string') {
+      m.thinkingChars += d.thinking.length;
+    } else if (d?.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+      m.toolUseChars += d.partial_json.length;
+    }
+  } else if (event === 'message_delta') {
+    // Authoritative final output_tokens lives here; merge over the message_start
+    // baseline so the host event records the billed number, not the placeholder
+    // (message_start ships `output_tokens: 1` on day-zero Sonnet 4).
+    const u = obj.usage as Partial<Usage> | undefined;
+    if (u) {
+      if (!state.usage) state.usage = {} as Usage;
+      const cur = state.usage;
+      if (typeof u.output_tokens === 'number') cur.output_tokens = u.output_tokens;
+      if (typeof u.input_tokens === 'number' && cur.input_tokens === undefined) {
+        cur.input_tokens = u.input_tokens;
+      }
+      if (typeof u.cache_creation_input_tokens === 'number') {
+        cur.cache_creation_input_tokens = u.cache_creation_input_tokens;
+      }
+      if (typeof u.cache_read_input_tokens === 'number') {
+        cur.cache_read_input_tokens = u.cache_read_input_tokens;
+      }
+    }
+  }
+}
+
+/** Measure non-stream `messages.content[]` directly. Same shape as the SSE
+ *  accumulator — output_*_chars carry char counts, redactedBlockCount counts
+ *  `redacted_thinking` blocks (no chars available). */
+function measureFromMessageJson(j: unknown): OutputMeasurement {
+  const m: OutputMeasurement = { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 };
+  const content = (j as { content?: unknown })?.content;
+  if (!Array.isArray(content)) return m;
+  for (const block of content) {
+    const b = block as { type?: string; text?: unknown; thinking?: unknown; input?: unknown };
+    if (b?.type === 'text' && typeof b.text === 'string') {
+      m.textChars += b.text.length;
+    } else if (b?.type === 'thinking' && typeof b.thinking === 'string') {
+      m.thinkingChars += b.thinking.length;
+    } else if (b?.type === 'redacted_thinking') {
+      m.redactedBlockCount += 1;
+    } else if (b?.type === 'tool_use') {
+      try {
+        m.toolUseChars += JSON.stringify(b.input ?? {}).length;
+      } catch {
+        /* circular / unserialisable input — leave the counter as-is */
+      }
+    }
+  }
+  return m;
+}
+
+/**
+ * Tee the response body so we can scan for the usage block AND the per-event
+ * char counts for honest output measurement. Returns the un-touched response
+ * to forward to the client + a Promise that resolves to the parsed Usage and
+ * a Promise that resolves to the measurement (both `undefined` when we can't
+ * extract them — e.g. unknown content-type, 5xx, no body).
+ *
+ * Streaming responses are scanned to EOF (not the old 64 KiB cap) because the
+ * final `output_tokens` lives in the `message_delta` at the end of the stream
+ * and `redacted_thinking` blocks can appear anywhere. The scanner is cheap
+ * (regex-free incremental SSE parser) and the tee back-pressure is no worse
+ * than the previous "drain to /dev/null in the background" path.
+ *
+ * For upstream 4xx responses, we tee the body to capture up to `ERROR_BODY_MAX`
+ * chars so the host can log what Anthropic actually rejected. 5xx still bails.
  */
 function teeForUsage(res: Response): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
   errorBodyPromise: Promise<string | undefined>;
+  measurementPromise: Promise<OutputMeasurement | undefined>;
 } {
   // No body at all: nothing to extract on either path.
   if (!res.body) {
@@ -107,6 +236,7 @@ function teeForUsage(res: Response): {
       response: res,
       usagePromise: Promise.resolve(undefined),
       errorBodyPromise: Promise.resolve(undefined),
+      measurementPromise: Promise.resolve(undefined),
     };
   }
   // 4xx: tee for the error body but skip usage scanning entirely.
@@ -141,6 +271,7 @@ function teeForUsage(res: Response): {
       }),
       usagePromise: Promise.resolve(undefined),
       errorBodyPromise,
+      measurementPromise: Promise.resolve(undefined),
     };
   }
   // 5xx: skip both (the host already synthesizes an error message).
@@ -149,52 +280,53 @@ function teeForUsage(res: Response): {
       response: res,
       usagePromise: Promise.resolve(undefined),
       errorBodyPromise: Promise.resolve(undefined),
+      measurementPromise: Promise.resolve(undefined),
     };
   }
   const ct = (res.headers.get('content-type') ?? '').toLowerCase();
   const [forClient, forUs] = res.body.tee();
 
-  const usagePromise = (async (): Promise<Usage | undefined> => {
+  // Single scan resolves both usage and measurement together. We expose them
+  // as separate promises (resolved from the same shared payload) so callers
+  // can stay readable; both wait on the same underlying read loop.
+  const scanResult = (async (): Promise<{
+    usage: Usage | undefined;
+    measurement: OutputMeasurement | undefined;
+  }> => {
     const reader = forUs.getReader();
     const decoder = new TextDecoder();
     let buf = '';
-    const drain = async () => {
-      try {
-        while (true) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
-      } catch {
-        /* ignore */
-      }
-    };
 
     try {
       if (ct.includes('text/event-stream')) {
-        // SSE: usage is in the FIRST event (`message_start`). Cap scan at 64
-        // KiB so we don't hold the tee buffer open for the entire stream.
-        const MAX = 65536;
-        while (buf.length < MAX) {
+        // SSE: walk every event to EOF. Final output_tokens is in message_delta
+        // (last event before message_stop); redacted_thinking blocks can appear
+        // anywhere. Tee back-pressure is bounded by the slower-reader's buffer,
+        // which here is whichever of the proxy/scanner falls behind — both run
+        // at network speed in practice.
+        const m: OutputMeasurement = {
+          textChars: 0,
+          thinkingChars: 0,
+          toolUseChars: 0,
+          redactedBlockCount: 0,
+        };
+        const state: { usage: Usage | undefined } = { usage: undefined };
+        while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          const idx = buf.indexOf('event: message_start');
-          if (idx >= 0) {
-            // The data: line follows. Match the first data: after that idx.
-            const m = /^data:\s*(.+)$/m.exec(buf.slice(idx));
-            if (m) {
-              try {
-                const j = JSON.parse(m[1]!);
-                void drain();
-                return j?.message?.usage as Usage | undefined;
-              } catch {
-                /* not yet a complete JSON line — keep reading */
-              }
-            }
+          // Drain every complete event (terminated by a blank line per SSE spec).
+          let evEnd: number;
+          while ((evEnd = buf.indexOf('\n\n')) >= 0) {
+            const block = buf.slice(0, evEnd);
+            buf = buf.slice(evEnd + 2);
+            processSseEvent(block, m, state);
           }
         }
-        void drain();
-        return undefined;
+        buf += decoder.decode();
+        // Trailing partial event (no blank line) — try once for robustness.
+        if (buf.trim().length > 0) processSseEvent(buf, m, state);
+        return { usage: state.usage, measurement: m };
       }
 
       if (ct.includes('application/json')) {
@@ -207,16 +339,27 @@ function teeForUsage(res: Response): {
         }
         try {
           const j = JSON.parse(buf);
-          return j?.usage as Usage | undefined;
+          return {
+            usage: j?.usage as Usage | undefined,
+            measurement: measureFromMessageJson(j),
+          };
         } catch {
-          return undefined;
+          return { usage: undefined, measurement: undefined };
         }
       }
     } catch {
       /* tee may be released early if the client aborts — ignore */
     }
-    void drain();
-    return undefined;
+    // Unknown content-type: drain so the tee buffer doesn't hold the stream open.
+    try {
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch {
+      /* ignore */
+    }
+    return { usage: undefined, measurement: undefined };
   })();
 
   return {
@@ -225,8 +368,9 @@ function teeForUsage(res: Response): {
       statusText: res.statusText,
       headers: res.headers,
     }),
-    usagePromise,
+    usagePromise: scanResult.then((s) => s.usage),
     errorBodyPromise: Promise.resolve(undefined),
+    measurementPromise: scanResult.then((s) => s.measurement),
   };
 }
 
@@ -459,6 +603,7 @@ export function createProxy(config: ProxyConfig = {}) {
       firstByteMs?: number,
       usage?: Usage,
       errorBody?: string,
+      measurement?: OutputMeasurement,
     ): void => {
       const is4xx = status >= 400 && status < 500;
       // Gzip the full body only when we actually need it — i.e. status is 4xx
@@ -509,6 +654,7 @@ export function createProxy(config: ProxyConfig = {}) {
           errorBody,
           reqBodySha8,
           reqBodyGz,
+          measurement,
         });
       };
       void finalize();
@@ -612,16 +758,20 @@ export function createProxy(config: ProxyConfig = {}) {
     // client gets one side immediately; we read the other in the background.
     // For 4xx responses we also tee to capture the error body (up to 2 KiB)
     // so the host can log what Anthropic actually rejected.
-    const { response: teed, usagePromise, errorBodyPromise } = teeForUsage(upstreamRes);
+    const { response: teed, usagePromise, errorBodyPromise, measurementPromise } =
+      teeForUsage(upstreamRes);
 
-    // Fire the host event once usage AND any captured error body are known
-    // (or once we've given up on finding them). Don't await — the response
-    // below is what unblocks the client; fire happens in the background.
+    // Fire the host event once usage AND any captured error body AND the output
+    // measurement are known (or once we've given up on finding them). Don't
+    // await — the response below is what unblocks the client; fire happens in
+    // the background. measurementPromise resolves from the same shared stream
+    // read as usagePromise, so this Promise.all doesn't add latency.
     void Promise.all([
       usagePromise.catch(() => undefined),
       errorBodyPromise.catch(() => undefined),
-    ]).then(([usage, errorBody]) =>
-      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody),
+      measurementPromise.catch(() => undefined),
+    ]).then(([usage, errorBody, measurement]) =>
+      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement),
     );
 
     return new Response(teed.body, {

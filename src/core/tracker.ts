@@ -112,6 +112,24 @@ export interface TrackEvent {
   /** Server-side web search calls billed per-request (not per-token). */
   web_search_requests?: number;
 
+  /** Ground-truth output measurement from streaming the response body
+   *  ourselves. `text_chars_measured` / `thinking_chars_measured` /
+   *  `tool_use_chars_measured` count Unicode code units of the corresponding
+   *  payloads (`text_delta`, `thinking_delta`, `input_json_delta` for SSE;
+   *  `content[].text` / `.thinking` / JSON-encoded `.input` for non-stream).
+   *  `redacted_block_count_measured` is the number of `redacted_thinking`
+   *  blocks Anthropic returned — chars are unavailable for these (the field
+   *  is opaque server-encrypted bytes), so they get a low/mid/high estimate
+   *  at the dashboard layer instead of a precise char count. Independent of
+   *  Anthropic's `usage.output_tokens` — gives a real ruler against the
+   *  redacted_thinking-inflated bill that surfaced the May-2026 weekly-meter
+   *  audit. Absent on requests that didn't yield a body we could scan (no
+   *  upstream response, 5xx, unknown content-type). */
+  text_chars_measured?: number;
+  thinking_chars_measured?: number;
+  tool_use_chars_measured?: number;
+  redacted_block_count_measured?: number;
+
   /** Ground-truth pre-compression token count from a parallel call to
    *  /v1/messages/count_tokens on the ORIGINAL request body. The endpoint
    *  is free (no billing). Absent when the probe failed; those events are
@@ -282,6 +300,19 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     // Server-side tools (e.g. web_search) bill per-request, not per-token.
     if (u.server_tool_use?.web_search_requests !== undefined)
       out.web_search_requests = u.server_tool_use.web_search_requests;
+  }
+  // Ground-truth output measurement from streaming the response body. These
+  // numbers are independent of Anthropic's `usage.output_tokens` and let us
+  // give a low/mid/high range against the redacted_thinking-inflated bill.
+  // Absent on requests that didn't yield a body we could scan (no body,
+  // upstream 5xx, unknown content-type).
+  const m = ev.measurement;
+  if (m) {
+    if (m.textChars > 0) out.text_chars_measured = m.textChars;
+    if (m.thinkingChars > 0) out.thinking_chars_measured = m.thinkingChars;
+    if (m.toolUseChars > 0) out.tool_use_chars_measured = m.toolUseChars;
+    if (m.redactedBlockCount > 0)
+      out.redacted_block_count_measured = m.redactedBlockCount;
   }
   return out;
 }

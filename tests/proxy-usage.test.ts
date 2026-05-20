@@ -684,4 +684,324 @@ describe('proxy usage extraction', () => {
     expect(captured).toBeDefined();
     expect(captured!.info?.baselineTokens).toBeUndefined();
   });
+
+  // ---- Ground-truth output measurement (Task #22) ----------------------
+  //
+  // The proxy scans the response stream for `text_delta` / `thinking_delta`
+  // chars and `redacted_thinking` block counts. These numbers are
+  // INDEPENDENT of Anthropic's `usage.output_tokens` — they're a raw ruler
+  // against the redacted_thinking-inflated bill we surfaced in the May-2026
+  // weekly-meter audit. The dashboard layer turns them into low/mid/high
+  // bands; the proxy layer just has to count honestly.
+
+  it('measures SSE text_delta chars across multiple delta events', async () => {
+    // Three text_delta events spanning a couple of code points each — the
+    // ruler must use STRING length (UTF-16 code units), matching what
+    // `JSON.stringify(text).length` would count if we re-serialized.
+    const sseBody =
+      'event: message_start\n' +
+      `data: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: 'msg_m1', type: 'message', role: 'assistant', content: [],
+          usage: { input_tokens: 10, output_tokens: 1 },
+        },
+      })}\n\n` +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}\n\n' +
+      'event: message_delta\n' +
+      'data: {"type":"message_delta","delta":{},"usage":{"output_tokens":42}}\n\n' +
+      'event: message_stop\n' +
+      'data: {"type":"message_stop"}\n\n';
+
+    const restore = mockUpstream(
+      () =>
+        new Response(sseBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    // 'hello ' (6) + 'world' (5) + '!' (1) = 12 chars.
+    expect(captured!.measurement?.textChars).toBe(12);
+    expect(captured!.measurement?.thinkingChars).toBe(0);
+    expect(captured!.measurement?.toolUseChars).toBe(0);
+    expect(captured!.measurement?.redactedBlockCount).toBe(0);
+    // Final output_tokens from message_delta overrides message_start's 1.
+    expect(captured!.usage?.output_tokens).toBe(42);
+  });
+
+  it('measures SSE thinking_delta chars and counts redacted_thinking blocks', async () => {
+    // Extended thinking turn: a `thinking` block and a `redacted_thinking`
+    // block. The redacted block has no readable chars (server-encrypted
+    // bytes), so we just count the block — the dashboard surfaces it as
+    // an opaque low/mid/high estimate.
+    const sseBody =
+      'event: message_start\n' +
+      `data: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: 'msg_m2', type: 'message', role: 'assistant', content: [],
+          usage: { input_tokens: 100, output_tokens: 1 },
+        },
+      })}\n\n` +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 1: "}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason carefully"}}\n\n' +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}\n\n' +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"alsoopaque"}}\n\n' +
+      'event: message_delta\n' +
+      'data: {"type":"message_delta","delta":{},"usage":{"output_tokens":500}}\n\n' +
+      'event: message_stop\n' +
+      'data: {"type":"message_stop"}\n\n';
+
+    const restore = mockUpstream(
+      () =>
+        new Response(sseBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    // 'step 1: ' (8) + 'reason carefully' (16) = 24 chars.
+    expect(captured!.measurement?.thinkingChars).toBe(24);
+    expect(captured!.measurement?.textChars).toBe(0);
+    expect(captured!.measurement?.redactedBlockCount).toBe(2);
+    expect(captured!.usage?.output_tokens).toBe(500);
+  });
+
+  it('measures SSE tool_use chars via input_json_delta', async () => {
+    // tool_use blocks stream their `input` field as a JSON string assembled
+    // from `input_json_delta` events. We count the raw JSON-string length —
+    // that's the closest apples-to-apples we get against the billed body.
+    const sseBody =
+      'event: message_start\n' +
+      `data: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: 'msg_m3', type: 'message', role: 'assistant', content: [],
+          usage: { input_tokens: 50, output_tokens: 1 },
+        },
+      })}\n\n` +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"cmd\\":"}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"ls\\"}"}}\n\n' +
+      'event: message_delta\n' +
+      'data: {"type":"message_delta","delta":{},"usage":{"output_tokens":20}}\n\n' +
+      'event: message_stop\n' +
+      'data: {"type":"message_stop"}\n\n';
+
+    const restore = mockUpstream(
+      () =>
+        new Response(sseBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    // '{"cmd":' (7) + '"ls"}' (5) = 12 chars.
+    expect(captured!.measurement?.toolUseChars).toBe(12);
+    expect(captured!.measurement?.textChars).toBe(0);
+    expect(captured!.measurement?.thinkingChars).toBe(0);
+  });
+
+  it('measures non-stream JSON response by walking content[]', async () => {
+    // Non-stream path: the whole body is one JSON object. Counter walks
+    // content[] and adds up text/thinking chars, tool_use input chars, and
+    // redacted_thinking blocks. Same shape as the SSE accumulator — the
+    // ruler must report the SAME numbers regardless of transport.
+    const responseBody = JSON.stringify({
+      id: 'msg_n1',
+      type: 'message',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'one two three' },
+        { type: 'thinking', thinking: 'reasoning here' },
+        { type: 'redacted_thinking', data: 'opaque1' },
+        { type: 'tool_use', id: 't1', name: 'bash', input: { cmd: 'ls' } },
+        { type: 'text', text: '!!' },
+      ],
+      model: 'claude-opus-4-5',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 5, output_tokens: 99 },
+    });
+
+    const restore = mockUpstream(
+      () =>
+        new Response(responseBody, {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    // 'one two three' (13) + '!!' (2) = 15 chars text.
+    expect(captured!.measurement?.textChars).toBe(15);
+    // 'reasoning here' = 14.
+    expect(captured!.measurement?.thinkingChars).toBe(14);
+    // tool_use input JSON.stringify({cmd:'ls'}) = '{"cmd":"ls"}' = 12 chars.
+    expect(captured!.measurement?.toolUseChars).toBe(12);
+    expect(captured!.measurement?.redactedBlockCount).toBe(1);
+  });
+
+  it('leaves measurement undefined on 5xx (no body to scan)', async () => {
+    // Upstream 5xx bails on usage AND measurement — the host synthesizes
+    // an error message and the body is whatever Anthropic returned, which
+    // by convention we don't try to parse. The dashboard event will just
+    // skip the row from output-honesty math.
+    const restore = mockUpstream(
+      () =>
+        new Response('upstream broke', {
+          status: 503,
+          headers: { 'content-type': 'text/plain' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    expect(captured!.status).toBe(503);
+    expect(captured!.measurement).toBeUndefined();
+  });
+
+  it('handles message_start with no usage gracefully (still measures content)', async () => {
+    // Defensive: if a future Anthropic release ships a message_start
+    // without `usage`, the proxy should still scan deltas and report
+    // measurement. Only the usage rollup degrades.
+    const sseBody =
+      'event: message_start\n' +
+      'data: {"type":"message_start","message":{"id":"x","type":"message","role":"assistant","content":[]}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi there"}}\n\n' +
+      'event: message_stop\n' +
+      'data: {"type":"message_stop"}\n\n';
+
+    const restore = mockUpstream(
+      () =>
+        new Response(sseBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    expect(captured!.measurement?.textChars).toBe(8);
+  });
 });
