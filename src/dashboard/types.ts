@@ -1,8 +1,6 @@
-// Shape of the JSON payloads the Node host emits. Kept here so the components
-// don't drift from `src/dashboard.ts` — when the server contract changes, both
-// sides update together.
+// JSON payload shapes for the dashboard. Single source of truth — update here when src/dashboard.ts changes.
 
-/** /proxy-stats payload — the live counters cards + sub-lines. */
+/** /proxy-stats payload. */
 export interface StatsPayload {
   port: number;
   uptime_sec: number;
@@ -15,21 +13,15 @@ export interface StatsPayload {
   /** Back-compat duplicate of `saved_pct_input_only`. */
   saved_pct: number;
   saved_pct_input_only: number;
-  /** DEPRECATED — denominator was filtered to measured-rows-only, which
-   *  cherry-picks the wins. Kept on the wire for back-compat. */
+  /** DEPRECATED — denominator was measured-rows-only (cherry-picks wins). Kept for back-compat. */
   saved_pct_of_total_bill: number;
-  /** Honest "share of total bill saved": measured-rows savings ÷ ALL paid
-   *  requests in the window (compressed + passthrough + probe-failed). */
+  /** Measured-rows savings ÷ ALL paid requests (compressed + passthrough + probe-failed). */
   saved_pct_of_all_spend: number;
   all_baseline_equivalent_weighted: number;
   all_actual_input_weighted: number;
   all_output_weighted: number;
   all_usage_requests: number;
-  /** Direct observed compressed-vs-passthrough split. Headline answers
-   *  "is the compressed path cheaper per request on real traffic" without
-   *  inventing a counterfactual. `split_sufficient_sample` gates the
-   *  per-request delta on a minimum count per bucket (UI hides the delta
-   *  number below the threshold and shows a "small sample" caveat). */
+  /** Observed cost split: compressed vs passthrough paths on real traffic. `split_sufficient_sample` gates the per-request delta (UI shows caveat below threshold). */
   compressed_paid_requests: number;
   passthrough_paid_requests: number;
   compressed_actual_usd: number;
@@ -62,7 +54,7 @@ export interface PricingAssumptions {
   source: string;
 }
 
-/** /proxy-recent payload — the table + preview pane. */
+/** /proxy-recent payload. */
 export interface RecentPayload {
   recent: RecentRow[];
   has_preview: boolean;
@@ -89,16 +81,14 @@ export interface RecentRow {
   img_ids?: number[];
 }
 
-/** /api/sessions.json payload — bulk session aggregate + selection table. */
+/** /api/sessions.json payload. */
 export interface SessionsPayload {
   sessions: SessionRow[];
   count: number;
 }
 
 export interface SessionRow {
-  // Mirrors the server's `SessionSummary` (core/sessions.ts) as serialized by
-  // `serveSessionsJson`. Field names MUST match the JSON payload exactly —
-  // the server is the source of truth here.
+  // Field names MUST match the JSON from serveSessionsJson (core/sessions.ts).
   id: string;
   project: string | null;
   firstSeen: string;
@@ -119,7 +109,7 @@ export interface ClaudeCodeRef {
   firstUserPreview?: string;
 }
 
-/** /api/stats.json payload — full-history aggregate. */
+/** /api/stats.json payload. */
 export interface FullStatsPayload {
   parsed: number;
   dropped: number;
@@ -149,35 +139,27 @@ export interface FullStatsSummary {
   firstByteP95: number;
 }
 
-/** /api/compression POST response. */
+/** POST /api/compression response. */
 export interface CompressionToggleResponse {
   compression_enabled: boolean;
 }
 
-/** /api/current-session.json payload — per-session aggregates for the most-recently-active Claude Code session.
- *  Carries the dollar-weighted baseline/actual input the headline shows PLUS
- *  the session-wide totals (`allActualInputWeighted` + `allOutputWeighted`)
- *  needed to compute the honest saved-% ratio against the full session bill
- *  instead of just the measured slice. */
+/** /api/current-session.json — aggregates for the most-recently-active session.
+ *  Includes session-wide totals needed for the honest saved-% against the full bill (not just measured slice). */
 export interface CurrentSessionPayload {
   sessionId: string | null;
   message?: string;
   baselineInputWeighted?: number;
   actualInputWeighted?: number;
   baselineMeasuredCount?: number;
-  /** Sum of `actualInputWeighted` across EVERY request in the session
-   *  (measured or not). Pairs with `allOutputWeighted` to form the full
-   *  session bill — the honest denominator for the saved-% ratio. */
+  /** Σ actualInputWeighted over all session requests — honest denominator for saved-% against the full bill. */
   allActualInputWeighted?: number;
-  /** Sum of `outputWeighted` across EVERY request in the session. */
+  /** Σ outputWeighted over all session requests. */
   allOutputWeighted?: number;
-  /** RAW token sums (no rate weighting). The honest headline compression:
-   *  1 − rawActualTokens/rawBaselineTokens. rawActual = Σ(input+cache_create+
-   *  cache_read) real usage; rawBaseline = Σ baseline_tokens (count_tokens of the
-   *  same body as text). Two real server numbers, one division. */
+  /** Raw input tokens (no rate weighting): Σ(input+cache_create+cache_read). Headline: 1 − rawActual/rawBaseline. */
   rawActualTokens?: number;
+  /** Σ count_tokens of each body as plain text — the baseline side. */
   rawBaselineTokens?: number;
-  /** Raw output tokens (the reply). Not compressed; added to both sides for the
-   *  honest TOTAL reduction so the headline isn't input-only cherry-picking. */
+  /** Raw output tokens. Added to both sides so the headline isn't input-only. */
   rawOutputTokens?: number;
 }

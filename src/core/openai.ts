@@ -1,10 +1,7 @@
 /**
  * OpenAI Chat Completions transformer for GPT 5.5.
- *
- * This intentionally does not share the Anthropic cache-control path:
- * OpenAI chat requests carry system/developer messages in `messages[]`, image
- * inputs as `image_url` parts on user messages, and no Anthropic prompt-cache
- * breakpoints. Keep this as a separate branch so Claude behaviour stays stable.
+ * Intentionally separate from the Anthropic path: no cache-control breakpoints,
+ * images as image_url parts, system/developer messages in messages[].
  */
 
 import {
@@ -85,8 +82,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
   minCompressChars: 2000,
   cols: 313,
   multiCol: 1,
-  // Conservative OpenAI-side default. Hosts can override after telemetry.
-  charsPerToken: 4,
+  charsPerToken: 4, // conservative OpenAI default; override after telemetry
   reflow: true,
 };
 
@@ -233,8 +229,7 @@ function openAIImagePart(img: RenderedImage): OpenAIImagePart {
     type: 'image_url',
     image_url: {
       url: `data:image/png;base64,${bytesToBase64(img.png)}`,
-      // Dense text renders need the high-detail vision path to remain legible.
-      detail: 'high',
+      detail: 'high', // dense text needs high-detail vision to remain legible
     },
   };
 }

@@ -1,10 +1,6 @@
 /**
- * The pxpipe proxy as a single Web-standard fetch handler.
- *
- * Both `src/node.ts` and `src/worker.ts` adapt this to their respective
- * runtimes (node:http server vs CF Worker `fetch` export). The handler
- * itself only uses `Request`, `Response`, `URL`, and global `fetch` — all
- * of which exist identically in Node 18+ and Workers.
+ * pxpipe proxy as a single Web-standard fetch handler.
+ * Adapted by src/node.ts and src/worker.ts; uses only Request/Response/URL/fetch.
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
@@ -17,18 +13,12 @@ import {
 import type { Usage } from './types.js';
 
 export interface ProxyConfig {
-  /** Provider mode. 'cloudflare-ai-gateway' derives both upstreams from
-   *  `gatewayBaseUrl` (`{base}/anthropic` and `{base}/openai`) and rewrites
-   *  OpenAI paths to the gateway's shape (`/v1/chat/completions` →
-   *  `/chat/completions`). Anthropic paths keep their `/v1/...` shape.
-   *  Unrecognized paths pass through to the family route untouched. */
+  /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
+   *  OpenAI paths drop the `/v1` prefix to match gateway shape. */
   provider?: 'cloudflare-ai-gateway';
-  /** Gateway base URL (account/gateway-scoped). Required when provider is
-   *  set. Comes from env/config only — never hardcoded. Overrides
-   *  `upstream`/`openAIUpstream`. */
+  /** Gateway base URL (account/gateway-scoped). Required when provider is set. */
   gatewayBaseUrl?: string;
-  /** Extra headers injected on every upstream request (e.g. gateway auth
-   *  headers). Values come from env/config only. */
+  /** Extra headers injected on every upstream request (e.g. gateway auth). */
   gatewayHeaders?: Record<string, string>;
   /** Anthropic API base, no trailing slash. Defaults to api.anthropic.com. */
   upstream?: string;
@@ -38,11 +28,8 @@ export interface ProxyConfig {
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
-  /** Per-request transform options. Pass a function when the host wants to
-   *  inject DYNAMIC values per request (e.g. live empirical `charsPerToken`
-   *  from the dashboard's converging fit) — the proxy invokes it once per
-   *  /v1/messages POST. Static object form is used by the Workers host and
-   *  tests that don't need dynamic state. */
+  /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
+   *  static object for Workers/tests. */
   transform?: TransformOptions | (() => TransformOptions);
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
@@ -52,9 +39,7 @@ export interface ProxyEvent {
   method: string;
   path: string;
   status: number;
-  /** Wall-clock ms from request start to event fire (≈ end of upstream response
-   *  body, since we now wait for usage extraction). For first-byte latency see
-   *  firstByteMs. */
+  /** Wall-clock ms from request start to event fire (≈ end of upstream body). */
   durationMs: number;
   /** Wall-clock ms from request start to upstream response headers. */
   firstByteMs?: number;
@@ -62,41 +47,24 @@ export interface ProxyEvent {
   /** Usage block from Anthropic's response — input/output/cache tokens. */
   usage?: Usage;
   error?: string;
-  /** First ~2 KiB of the upstream response body when status is in [400, 499].
-   *  Lets us see what Anthropic actually rejected without re-running the request.
-   *  Not captured for 2xx (no error) or 5xx (we synthesize our own message). */
+  /** First ~2 KiB of the upstream 4xx body (not captured on 2xx or 5xx). */
   errorBody?: string;
-  /** sha256[0..8] of the TRANSFORMED outgoing request body. Set on every
-   *  /v1/messages POST regardless of status. Lets future debuggers correlate
-   *  "same payload, sometimes works, sometimes fails" without storing bodies. */
+  /** sha256[0..8] of the transformed outgoing body — set on every /v1/messages POST for correlation. */
   reqBodySha8?: string;
-  /** Full gzipped transformed body, populated only on 4xx. The Node host may
-   *  redirect this to a sidecar file (see reqBodySamplePath) before the
-   *  tracker serializes the event; Workers always inline-cap at 32 KiB. */
+  /** Gzipped transformed body, populated only on 4xx. Node may write to sidecar (see reqBodySamplePath). */
   reqBodyGz?: Uint8Array;
-  /** Set by the Node host *in place of* reqBodyGz when it wrote the gzipped
-   *  body to a sidecar file. The path lands in the JSONL as
-   *  `req_body_sample_path`. */
+  /** Set by the Node host instead of reqBodyGz when the body was written to a sidecar file. */
   reqBodySamplePath?: string;
-  /** Ground-truth output measurement extracted from the response stream itself,
-   *  independent of Anthropic's `usage.output_tokens`. Lets the dashboard show
-   *  how much of the billed output was redacted_thinking (opaque server-encoded
-   *  bytes) vs real text/thinking/tool_use. Absent on requests that didn't
-   *  yield a body we could scan (no upstream response, 5xx, unknown
-   *  content-type). See OutputMeasurement for field meanings. */
+  /** Ground-truth char counts from the response stream, independent of usage.output_tokens.
+   *  Absent when the body couldn't be scanned (5xx, unknown content-type). See OutputMeasurement. */
   measurement?: OutputMeasurement;
 }
 
-/** Max chars of upstream error body we surface on ProxyEvent. Keeps the JSONL
- *  line small while still being big enough to hold Anthropic's full error JSON
- *  (typically a few hundred bytes). */
+/** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
 
-/** Cheap, bounded read of the top-level `model` field from an Anthropic
- *  /v1/messages body. The field sits near the start of the JSON, so we decode
- *  only the head rather than JSON-parsing the (potentially multi-MB) full
- *  conversation just to read one string. Returns null when not found — callers
- *  treat null as "outside supported scope" (fail-closed). */
+/** Read the top-level `model` field from a /v1/messages body without parsing the full JSON.
+ *  Returns null when not found — callers treat null as outside supported scope (fail-closed). */
 function readModelField(body: Uint8Array): string | null {
   try {
     const head = new TextDecoder().decode(body.subarray(0, 8192));
@@ -107,11 +75,9 @@ function readModelField(body: Uint8Array): string | null {
   }
 }
 
-/** Gzip a byte buffer using the standard `CompressionStream`. Available in
- *  Node 18+ and Cloudflare Workers — no Buffer / no zlib. */
+/** Gzip via CompressionStream — available in Node 18+ and Cloudflare Workers. */
 async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
-  // `body as BufferSource`: TS doesn't model Response taking a Uint8Array
-  // directly even though it works in both runtimes.
+  // Cast: TS doesn't model Response(Uint8Array) even though it works in both runtimes.
   const stream = new Response(body as BufferSource).body!.pipeThrough(
     new CompressionStream('gzip'),
   );
@@ -119,10 +85,9 @@ async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(buf);
 }
 
-/** sha256[0..8] of a byte buffer, hex. Same shape as the existing sha8(text)
- *  helper in transform.ts but works on raw bytes (no extra encode pass). */
+/** sha256[0..8] hex of a byte buffer. */
 async function sha8Bytes(body: Uint8Array): Promise<string> {
-  // Cast to BufferSource — Web Crypto accepts Uint8Array at runtime.
+  // Cast: Web Crypto accepts Uint8Array at runtime despite the BufferSource type.
   const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
   const bytes = new Uint8Array(digest);
   let hex = '';
@@ -131,22 +96,8 @@ async function sha8Bytes(body: Uint8Array): Promise<string> {
 }
 
 /**
- * Ground-truth output measurement extracted from the response stream itself.
- *
- *  - `textChars` / `thinkingChars` / `toolUseChars` count Unicode code units
- *    of the corresponding payload (`text_delta`, `thinking_delta`, and
- *    `input_json_delta` for SSE; `content[].text` / `.thinking` /
- *    JSON-encoded `.input` for non-stream responses).
- *  - `redactedBlockCount` is the number of `redacted_thinking` content blocks
- *    Anthropic returned — chars are unavailable for these (the field is
- *    opaque server-encrypted bytes), so they get a low/mid/high estimate at
- *    the dashboard layer instead of a precise char count.
- *
- * These numbers are independent of Anthropic's `usage.output_tokens` — they
- * give us a real ruler against the redacted_thinking-inflated bill, which is
- * exactly the gap the May-2026 weekly-meter audit surfaced. Live on `info`,
- * so they ride the existing TrackEvent pipeline; the dashboard layer turns
- * them into `output_chars_measured`, `tool_use_chars_measured`, etc.
+ * Ground-truth char counts from the response stream, independent of usage.output_tokens.
+ * redactedBlockCount blocks are opaque server bytes — no char count available for those.
  */
 export interface OutputMeasurement {
   textChars: number;
@@ -155,17 +106,13 @@ export interface OutputMeasurement {
   redactedBlockCount: number;
 }
 
-/** Walk a single SSE event (`event: …\ndata: …`) and fold it into the running
- *  usage + measurement accumulators. Quiet on malformed events — a stream
- *  with one corrupt line should not break the host's event log. */
+/** Parse one SSE block into the running usage + measurement accumulators. Silent on malformed input. */
 function processSseEvent(
   block: string,
   m: OutputMeasurement,
   state: { usage: Usage | undefined },
 ): void {
-  // Each SSE event is one or more lines; we only care about `event:` + `data:`.
-  // Continuation `data:` lines concatenate per the SSE spec, though Anthropic
-  // ships single-line JSON in practice.
+  // Parse `event:` + `data:` lines; continuation data: lines concatenate per SSE spec.
   let event = '';
   let data = '';
   for (const line of block.split('\n')) {
@@ -181,10 +128,7 @@ function processSseEvent(
   }
   const obj = j as Record<string, unknown>;
 
-  // OpenAI Chat Completions streaming chunks usually have no `event:` line:
-  // each SSE block is `data: { choices, usage }`, with usage present only
-  // when stream_options.include_usage is enabled. Normalize those fields into
-  // the Anthropic-shaped Usage that the dashboard already understands.
+  // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
   const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
   if (openAIUsage) state.usage = openAIUsage;
   measureOpenAIChoices(obj, m);
@@ -208,9 +152,7 @@ function processSseEvent(
       m.toolUseChars += d.partial_json.length;
     }
   } else if (event === 'message_delta') {
-    // Authoritative final output_tokens lives here; merge over the message_start
-    // baseline so the host event records the billed number, not the placeholder
-    // (message_start ships `output_tokens: 1` on day-zero Sonnet 4).
+    // Authoritative final output_tokens; merge over message_start (which ships output_tokens: 1).
     const u = obj.usage as Partial<Usage> | undefined;
     if (u) {
       if (!state.usage) state.usage = {} as Usage;
@@ -249,7 +191,7 @@ function normalizeUsage(raw: unknown): Usage | undefined {
     out.server_tool_use = u.server_tool_use as Usage['server_tool_use'];
   }
 
-  // OpenAI Chat Completions shape.
+  // OpenAI field aliases.
   if (typeof u.prompt_tokens === 'number') out.input_tokens = u.prompt_tokens;
   if (typeof u.completion_tokens === 'number') out.output_tokens = u.completion_tokens;
 
@@ -276,9 +218,7 @@ function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement
   }
 }
 
-/** Measure non-stream `messages.content[]` directly. Same shape as the SSE
- *  accumulator — output_*_chars carry char counts, redactedBlockCount counts
- *  `redacted_thinking` blocks (no chars available). */
+/** Measure non-streaming messages.content[] — same OutputMeasurement shape as the SSE accumulator. */
 function measureFromMessageJson(j: unknown): OutputMeasurement {
   const m: OutputMeasurement = { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 };
   if (j && typeof j === 'object') measureOpenAIChoices(j as Record<string, unknown>, m);
@@ -304,20 +244,9 @@ function measureFromMessageJson(j: unknown): OutputMeasurement {
 }
 
 /**
- * Tee the response body so we can scan for the usage block AND the per-event
- * char counts for honest output measurement. Returns the un-touched response
- * to forward to the client + a Promise that resolves to the parsed Usage and
- * a Promise that resolves to the measurement (both `undefined` when we can't
- * extract them — e.g. unknown content-type, 5xx, no body).
- *
- * Streaming responses are scanned to EOF (not the old 64 KiB cap) because the
- * final `output_tokens` lives in the `message_delta` at the end of the stream
- * and `redacted_thinking` blocks can appear anywhere. The scanner is cheap
- * (regex-free incremental SSE parser) and the tee back-pressure is no worse
- * than the previous "drain to /dev/null in the background" path.
- *
- * For upstream 4xx responses, we tee the body to capture up to `ERROR_BODY_MAX`
- * chars so the host can log what Anthropic actually rejected. 5xx still bails.
+ * Tee the response body to extract usage + output measurement without blocking the client.
+ * Streams are scanned to EOF (final output_tokens is in message_delta; redacted_thinking
+ * blocks can appear anywhere). 4xx bodies are capped at ERROR_BODY_MAX. 5xx is skipped.
  */
 function teeForUsage(res: Response): {
   response: Response;
@@ -354,7 +283,7 @@ function teeForUsage(res: Response): {
           if (done) break;
         }
       } catch {
-        /* client may have aborted; whatever we got is fine */
+        /* client may have aborted */
       }
       return out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out;
     })();
@@ -381,9 +310,7 @@ function teeForUsage(res: Response): {
   const ct = (res.headers.get('content-type') ?? '').toLowerCase();
   const [forClient, forUs] = res.body.tee();
 
-  // Single scan resolves both usage and measurement together. We expose them
-  // as separate promises (resolved from the same shared payload) so callers
-  // can stay readable; both wait on the same underlying read loop.
+  // Single read loop resolves both; exposed as separate promises for call-site readability.
   const scanResult = (async (): Promise<{
     usage: Usage | undefined;
     measurement: OutputMeasurement | undefined;
@@ -394,11 +321,7 @@ function teeForUsage(res: Response): {
 
     try {
       if (ct.includes('text/event-stream')) {
-        // SSE: walk every event to EOF. Final output_tokens is in message_delta
-        // (last event before message_stop); redacted_thinking blocks can appear
-        // anywhere. Tee back-pressure is bounded by the slower-reader's buffer,
-        // which here is whichever of the proxy/scanner falls behind — both run
-        // at network speed in practice.
+        // Walk every SSE event to EOF — message_delta (final output_tokens) is last.
         const m: OutputMeasurement = {
           textChars: 0,
           thinkingChars: 0,
@@ -410,7 +333,7 @@ function teeForUsage(res: Response): {
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          // Drain every complete event (terminated by a blank line per SSE spec).
+          // SSE events are terminated by a blank line.
           let evEnd: number;
           while ((evEnd = buf.indexOf('\n\n')) >= 0) {
             const block = buf.slice(0, evEnd);
@@ -419,13 +342,12 @@ function teeForUsage(res: Response): {
           }
         }
         buf += decoder.decode();
-        // Trailing partial event (no blank line) — try once for robustness.
-        if (buf.trim().length > 0) processSseEvent(buf, m, state);
+        if (buf.trim().length > 0) processSseEvent(buf, m, state); // trailing partial event
         return { usage: state.usage, measurement: m };
       }
 
       if (ct.includes('application/json')) {
-        // Non-stream: buffer fully (capped at 4 MiB).
+        // Buffer fully, capped at 4 MiB.
         const MAX = 4 * 1024 * 1024;
         while (buf.length < MAX) {
           const { done, value } = await reader.read();
@@ -443,9 +365,9 @@ function teeForUsage(res: Response): {
         }
       }
     } catch {
-      /* tee may be released early if the client aborts — ignore */
+      /* tee released early (client abort) */
     }
-    // Unknown content-type: drain so the tee buffer doesn't hold the stream open.
+    // Unknown content-type: drain to release the tee buffer.
     try {
       while (true) {
         const { done } = await reader.read();
@@ -526,10 +448,7 @@ async function countTokensUpstream(
   }
 }
 
-/** Resolved upstream routing for a config. Pure — unit-testable.
- *  In gateway mode both API families ride one base URL on their own
- *  provider routes; OpenAI paths drop the `/v1` prefix to match the
- *  gateway's path shape. No protocol translation anywhere. */
+/** Resolve upstream URLs from config. Pure — unit-testable. */
 export function resolveUpstreams(config: ProxyConfig): {
   anthropic: string;
   openai: string;
@@ -551,7 +470,7 @@ export function resolveUpstreams(config: ProxyConfig): {
   };
 }
 
-/** Parse `PXPIPE_GATEWAY_HEADERS` — JSON object or `k=v;k2=v2`. */
+/** Parse PXPIPE_GATEWAY_HEADERS — JSON object or `k=v;k2=v2`. */
 export function parseGatewayHeaders(spec: string | undefined): Record<string, string> {
   if (!spec) return {};
   const trimmed = spec.trim();
@@ -570,7 +489,7 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
   return out;
 }
 
-/** Build the proxy fetch handler bound to a config. */
+/** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
@@ -586,10 +505,7 @@ export function createProxy(config: ProxyConfig = {}) {
     const url = new URL(req.url);
     const path = url.pathname + url.search;
 
-    // Captured during the transform step. `reqBodyBytes` is the raw
-    // transformed body — kept around so we can gzip it lazily on 4xx without
-    // having to re-stringify. `reqBodySha8` is computed eagerly because
-    // it's cheap and lands on every event (4xx and 2xx) for correlation.
+    // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
 
@@ -603,30 +519,21 @@ export function createProxy(config: ProxyConfig = {}) {
       measurement?: OutputMeasurement,
     ): void => {
       const is4xx = status >= 400 && status < 500;
-      // Gzip the full body only when we actually need it — i.e. status is 4xx
-      // and we have bytes to capture. Awaiting inside an async IIFE keeps the
-      // fire() signature unchanged; the host receives the event once the
-      // gzip resolves (or immediately if not 4xx).
+      // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
       const finalize = async (): Promise<void> => {
         let reqBodyGz: Uint8Array | undefined;
         if (is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
           try {
             reqBodyGz = await gzipBytes(reqBodyBytes);
           } catch {
-            // gzip failure is non-fatal — drop the body sample, keep the rest.
+            // Non-fatal — drop body sample.
           }
         }
-        // Wait for the baseline count_tokens probes before persisting the
-        // event so both numbers land on the same row as the usage block.
-        // Each probe is independent: full-body baseline can land even if the
-        // cacheable-prefix probe fails (and vice versa). null/missing leaves
-        // the field absent; the dashboard's per-event math degrades cleanly.
+        // Await both count_tokens probes so baseline numbers land on the same event row.
+        // Each probe is independent; null leaves the field absent and dashboard math degrades cleanly.
         if (info && baselineStatusApplies) {
-          // Track both halves of the cache-aware baseline so we can honestly
-          // report whether a row is fully measured, partially measured, or
-          // un-measured. Without this, a missing cacheable-prefix probe was
-          // silently bucketed as cacheable=0 by the dashboard, which inflates
-          // the baseline and thus "$ saved". See dashboard.ts for the gating.
+          // Track both halves so the dashboard can gate on probe completeness (partial vs ok).
+          // A missing cacheable-prefix probe must NOT be treated as cacheable=0 — that fabricates savings.
           let baselineResolved: number | null = null;
           let cacheableExpected = false;
           let cacheableResolved: number | null = null;
@@ -635,7 +542,7 @@ export function createProxy(config: ProxyConfig = {}) {
               baselineResolved = await baselinePromise;
               if (baselineResolved !== null) info.baselineTokens = baselineResolved;
             } catch {
-              /* probe threw — drop, keep the rest of the event intact */
+              /* probe threw — drop */
             }
           }
           if (baselineCacheablePromise) {
@@ -644,20 +551,14 @@ export function createProxy(config: ProxyConfig = {}) {
               cacheableResolved = await baselineCacheablePromise;
               if (cacheableResolved !== null) info.baselineCacheableTokens = cacheableResolved;
             } catch {
-              /* probe threw — leave field absent */
+              /* probe threw */
             }
           }
           if (baselineResolved === null) {
             info.baselineProbeStatus = 'failed';
           } else if (cacheableExpected && cacheableResolved === null) {
-            // Body had cache_control markers but the prefix probe didn't
-            // come back. The dashboard MUST NOT treat this as cacheable=0
-            // (that would charge the unproxied counterfactual as if it had
-            // no cache reuse, fabricating savings). It excludes the row.
-            info.baselineProbeStatus = 'partial';
+            info.baselineProbeStatus = 'partial'; // dashboard excludes row; must not treat as cacheable=0
           } else {
-            // Either both probes resolved, or the body had no markers and
-            // cacheable=0 is exact by construction. Either way, honest.
             info.baselineProbeStatus = 'ok';
           }
         }
@@ -679,8 +580,7 @@ export function createProxy(config: ProxyConfig = {}) {
       void finalize();
     };
 
-    // Only transform known request shapes. Everything else passes through to
-    // the API family implied by its path.
+    // Transform only known shapes; everything else passes through.
     const isMessages = req.method === 'POST' && url.pathname === '/v1/messages';
     const isOpenAIChat = req.method === 'POST' && url.pathname === '/v1/chat/completions';
     const isModelsPath = url.pathname === '/v1/models' || url.pathname.startsWith('/v1/models/');
@@ -697,18 +597,10 @@ export function createProxy(config: ProxyConfig = {}) {
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
 
-    // Ground-truth baseline measurement. Fires /v1/messages/count_tokens TWO
-    // ways on the PRE-COMPRESSION body in parallel with the main forward:
-    //   baselinePromise          → full-body input_tokens (cold cost)
-    //   baselineCacheablePromise → input_tokens of the body TRUNCATED at the
-    //                              last cache_control marker (the prefix that
-    //                              would have cached on the unproxied path)
-    // Difference of the two is `cold_tail_tokens` (always-cold input on both
-    // proxied and unproxied paths). The dashboard combines them with the
-    // actual usage block's cache class to get an exact cache-aware baseline,
-    // not a cold-every-time approximation. Both resolve to a number or null
-    // (probe failed or no markers); land on info.baseline*Tokens before the
-    // host event persists.
+    // Two count_tokens probes on the pre-compression body (see docs/HISTORY_CACHE_MODEL.md):
+    //   baselinePromise          → full-body input_tokens
+    //   baselineCacheablePromise → input_tokens truncated at last cache_control marker
+    // Dashboard combines them for cache-aware baseline. Both run in parallel with the main forward.
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
@@ -718,11 +610,7 @@ export function createProxy(config: ProxyConfig = {}) {
       try {
         const transformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
-        // Model-scope gate (proxy boundary): pxpipe is validated only for
-        // the models in isPxpipeSupportedModel (Fable 5) on the Anthropic
-        // route; the OpenAI route has its own gate. Anything else passes
-        // through untransformed. Fail-closed: an unreadable model means no
-        // compression rather than a risky guess.
+        // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         const modelOk = isMessages
           ? isPxpipeSupportedModel(model)
@@ -737,9 +625,7 @@ export function createProxy(config: ProxyConfig = {}) {
             modelOk ? transformOpts : { ...transformOpts, compress: false },
           );
         if (!modelOk) r.info.reason = 'unsupported_model';
-        // Cast: TS narrows Uint8Array<ArrayBufferLike> away from BodyInit, but
-        // it's a valid body and we never use SharedArrayBuffer.
-        bodyOut = r.body as unknown as BodyInit;
+        bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
         if (r.body.byteLength > 0) {
@@ -748,20 +634,15 @@ export function createProxy(config: ProxyConfig = {}) {
 
         if (isMessages) {
           baselineStatusApplies = true;
-          // Kick off the count_tokens probes on the ORIGINAL body BEFORE the
-          // main forward so all three calls (full probe, cacheable-prefix probe,
-          // main /v1/messages) overlap. Anthropic doesn't bill count_tokens, so
-          // the cost is wall-clock only — typically ~30-80ms, fully hidden by
-          // the main forward latency.
+          // Probes fire on the ORIGINAL body before the main forward so all three overlap.
+          // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
           const ctBody = buildBaselineCountTokensBody(bodyIn);
           if (ctBody) {
             const ctHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
             ctHeaders.set('content-type', 'application/json');
             if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
             baselinePromise = countTokensUpstream(upstream, ctBody, ctHeaders);
-            // Second probe: body truncated at the last cache_control marker.
-            // Null body = no markers exist → cacheable=0 by definition, no
-            // probe needed.
+            // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
             if (ctCacheableBody) {
               baselineCacheablePromise = countTokensUpstream(
@@ -780,8 +661,7 @@ export function createProxy(config: ProxyConfig = {}) {
         });
       }
     } else {
-      // Pass body through unchanged.
-      bodyOut = req.body;
+      bodyOut = req.body; // pass through unchanged
     }
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
@@ -793,9 +673,7 @@ export function createProxy(config: ProxyConfig = {}) {
 
     applyGatewayHeaders(outHeaders);
 
-    // Gateway OpenAI routes use `/chat/completions` (no `/v1`); Anthropic
-    // routes keep `/v1/messages`. Anything else passes through as-is on the
-    // family route.
+    // Gateway OpenAI routes drop the `/v1` prefix; Anthropic routes keep it.
     const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
     const upstreamUrl = upstreamBase + outPath;
     let upstreamRes: Response;
@@ -817,18 +695,11 @@ export function createProxy(config: ProxyConfig = {}) {
 
     const firstByteMs = Date.now() - t0;
 
-    // Tee the upstream body so we can extract Anthropic's usage block. The
-    // client gets one side immediately; we read the other in the background.
-    // For 4xx responses we also tee to capture the error body (up to 2 KiB)
-    // so the host can log what Anthropic actually rejected.
+    // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
     const { response: teed, usagePromise, errorBodyPromise, measurementPromise } =
       teeForUsage(upstreamRes);
 
-    // Fire the host event once usage AND any captured error body AND the output
-    // measurement are known (or once we've given up on finding them). Don't
-    // await — the response below is what unblocks the client; fire happens in
-    // the background. measurementPromise resolves from the same shared stream
-    // read as usagePromise, so this Promise.all doesn't add latency.
+    // Fire event in background once all three resolve (measurementPromise shares the same stream read).
     void Promise.all([
       usagePromise.catch(() => undefined),
       errorBodyPromise.catch(() => undefined),

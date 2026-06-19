@@ -57,25 +57,18 @@ export interface ToolDef {
 
 export type SystemField = string | Array<TextBlock | ImageBlock>;
 
-/** Anthropic's per-response token usage block. Same shape on streaming
- *  (inside the message_start event payload) and non-streaming responses. */
+/** Anthropic token usage block — same shape on streaming (message_start) and non-streaming. */
 export interface Usage {
   input_tokens?: number;
   output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
-  /** Anthropic returns these inside a nested `cache_creation` object alongside
-   *  the flat `cache_creation_input_tokens` total. The 5-minute and 1-hour
-   *  tiers price differently (1.25x and 2x the input rate respectively), so
-   *  we need the split to compute honest cost. Optional — older API versions
-   *  and non-cache requests omit the nested object. */
+  /** Split by tier (5m=1.25×, 1h=2× base) for honest cost; absent on older API / non-cache requests. */
   cache_creation?: {
     ephemeral_5m_input_tokens?: number;
     ephemeral_1h_input_tokens?: number;
   };
-  /** Server-side tool use Anthropic bills separately from message tokens (web
-   *  search is per-request, not per-token). Captured so the dashboard can
-   *  account for it; absent on requests with no server tool calls. */
+  /** Server tool billing (web search = per-request, not per-token); absent when unused. */
   server_tool_use?: {
     web_search_requests?: number;
   };

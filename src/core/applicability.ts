@@ -14,38 +14,25 @@ export interface PxpipeApplicabilityInput {
   readonly bodyBytes?: number | null;
 }
 
-/** Bracketed variant tags that don't change reading behavior and so must not
- *  affect the gate — e.g. the context-window tag in `claude-opus-4-8[1m]`.
- *  Stripped before matching so a base model and its `[1m]` form gate alike. */
+/** Bracketed variant tags (e.g. `[1m]`) stripped before model matching so base and variant gate identically. */
 const VARIANT_TAG = /\[[^\]]*\]/g;
 
 function baseModelId(model: string): string {
   return model.replace(VARIANT_TAG, '');
 }
 
-/** Runtime override of the allowed-model scope, set from the dashboard
- *  ("compress models" chips). `null` = no override → fall back to the
- *  `PXPIPE_MODELS` env (or the built-in default). In-memory only; a restart
- *  drops it and the env/default scope applies again. */
+/** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Base model ids pxpipe is allowed to transform. Resolution order, read per
- *  call so the scope can be flipped LIVE (no rebuild/restart):
- *    1. runtime override (dashboard chips), if set
- *    2. `PXPIPE_MODELS` env (comma-separated)
- *    3. built-in default: **Fable 5 only**.
- *
- *  Opus 4.8 is OFF by default (opt-in via the dashboard or PXPIPE_MODELS): it
- *  uses the identical pipeline/render, but reads imaged content at a measurable
- *  tax (FINDINGS.md 2026-06-16: ~2pp arithmetic, 6/15 dense-hex recall vs
- *  Fable's 100/100, 13/15), so silently compressing the operator's main driver
- *  is the wrong default. Examples:
- *    PXPIPE_MODELS=claude-fable-5                 # Fable only (the default)
- *    PXPIPE_MODELS=claude-fable-5,claude-opus-4-8 # add Opus */
-/** The CONFIGURED scope — `PXPIPE_MODELS` env (comma-separated) or the built-in
- *  Fable-only default — IGNORING any dashboard runtime override. */
+/** Resolution order (read per-call so scope flips LIVE):
+ *  1. runtime override (dashboard chips) 2. PXPIPE_MODELS env 3. built-in default (Fable 5 only).
+ *  Opus 4.8 is off by default: same pipeline but measurably worse at reading imaged content
+ *  (FINDINGS.md 2026-06-16: ~2pp arithmetic, 6/15 dense-hex recall vs Fable's 100/100, 13/15) —
+ *  silently compressing the operator's main model is the wrong default. Opt in via dashboard or PXPIPE_MODELS. */
+/** PXPIPE_MODELS env / built-in Fable-only default, ignoring the runtime override. */
 function envOrDefaultBases(): string[] {
-  const raw = process.env.PXPIPE_MODELS;
+  // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
   return (raw && raw.trim() ? raw : 'claude-fable-5')
     .split(',')
     .map((s) => s.trim())
@@ -57,41 +44,30 @@ function allowedModelBases(): string[] {
   return envOrDefaultBases();
 }
 
-/** Current effective allowed-model scope (runtime override ?? env ?? default). */
+/** Current effective allowed-model scope. */
 export function getAllowedModelBases(): string[] {
   return allowedModelBases();
 }
 
-/** The configured base scope (`PXPIPE_MODELS` env, or the Fable-only default),
- *  independent of the dashboard runtime override. The dashboard unions this into
- *  its chip set so every env-enabled model is always offered as a toggle —
- *  even one switched off at runtime — instead of vanishing once it leaves the
- *  active scope. */
+/** PXPIPE_MODELS env / default scope, independent of runtime override.
+ *  Dashboard unions this into its chip set so env-enabled models are always shown as toggles. */
 export function getConfiguredModelBases(): string[] {
   return envOrDefaultBases();
 }
 
-/** Set the runtime allowed-model scope from the dashboard. An empty array means
- *  compress NO models (scope off); `null` clears the override and falls back to
- *  the env/default. In-memory only — not persisted across restart. */
+/** Set the dashboard runtime override. Empty array = compress nothing; null = clear override. Not persisted. */
 export function setAllowedModelBases(list: readonly string[] | null): void {
   runtimeModelBases = list === null ? null : list.map((s) => s.trim()).filter(Boolean);
 }
 
-/** True when pxpipe is allowed to transform requests for this model. A model
- *  matches an allowed base when it equals the base or extends it with a
- *  `-suffix` alias (`claude-fable-5-high`) — hosts may send either the client
- *  alias or the resolved upstream id. Bracketed variant tags (`[1m]`) are
- *  stripped first so `claude-opus-4-8[1m]` matches its base. */
+/** True when pxpipe may transform this model. Matches exact base or `-suffix` alias; [variant] tags stripped first. */
 export function isPxpipeSupportedModel(model: string | null | undefined): boolean {
   if (typeof model !== 'string') return false;
   const base = baseModelId(model);
   return allowedModelBases().some((b) => base === b || base.startsWith(`${b}-`));
 }
 
-/** GPT image-tokenization has not been validated across the whole OpenAI
- *  model matrix. Keep the new OpenAI path scoped to the requested GPT 5.5
- *  family until production telemetry says it is safe to widen. */
+/** GPT image-tokenization validated only for GPT 5.5 family; widen after production telemetry confirms safety. */
 export function isPxpipeSupportedGptModel(model: string | null | undefined): boolean {
   return typeof model === 'string' && /^gpt-5\.5(?:-|$)/.test(model);
 }

@@ -208,30 +208,29 @@ decides per-request; sparse prose is left as text.
 
 ## Library use (no proxy)
 
-```ts
-import { renderTextToPngs, estimateImageCount } from "pxpipe";
-
-const pngs = await renderTextToPngs(toolResultText);  // Buffer[], attach to the next user turn
-```
+Same engine, no proxy. Render text → PNGs, or run the full cache-safe transform:
 
 ```ts
-renderTextToPngs(text: string, cols?: number, style?: RenderStyle): Promise<Buffer[]>
-estimateImageCount(text: string, cols?: number): number   // gate yourself
-wrapLines(text: string, cols: number, markerScale?: number): string[]
+import { renderTextToPngs, transformAnthropicMessages } from "pxpipe";
+
+const imgs = await renderTextToPngs(toolResultText);            // RenderedImage[]
+const { body, applied, info } = await transformAnthropicMessages({
+  body: requestBytes,
+  model: "claude-fable-5",
+});
 ```
 
-| constant | value | meaning |
-|---|---|---|
-| `MAX_HEIGHT_PX` | 1 932 | page-height ceiling (~1932² max page) |
-| `DEFAULT_COLS` | 313 | static-slab width (→1573 px) |
-| `READABLE_CHARS_PER_IMAGE` | 50 000 | chars per static-slab page |
-| `DENSE_CONTENT_COLS` | 384 | dense tool/history width (→1928 px) |
-| `DENSE_CONTENT_CHARS_PER_IMAGE` | 92 160 | chars per dense page (full 1928×1928) |
+`options.keepSharp(block)` pins blocks as text (override the heuristic for IDs,
+hashes, paths); `options.emitRecoverable` returns the originals of imaged blocks
+so a stateful caller can recover them — the two halves of the fidelity contract
+for the lossy limitation below. Runtime is pure-JS (Node and edge/Workers);
+`@napi-rs/canvas` is build-time only. Full API, types, and constants:
+`src/core/index.ts`.
 
 ## Development
 
 ```bash
-pnpm install && pnpm test     # 342 tests
+pnpm install && pnpm test     # 354 tests
 pnpm run build                # regenerates dist/
 ```
 
@@ -241,7 +240,8 @@ pnpm run build                # regenerates dist/
 * Render latency: encoding PNGs adds time to large requests before they leave
   (partly offset by the model ingesting fewer tokens). Responses stream normally.
 * ASCII/Latin-1 well tested; CJK works but conservatively.
-* `node-canvas` native dep on Node.
+* Runtime is pure-JS — runs on Node and edge/Workers. `@napi-rs/canvas` is a
+  build-time-only dev dep (regenerating the glyph atlas), not a runtime dep.
 * Fable 5 only.
 
 ## Roadmap

@@ -26,6 +26,8 @@ export {
   transformRequest,
   type TransformInfo as PxpipeTransformInfo,
   type TransformOptions,
+  type KeepSharpBlock,
+  type RecoverableBlock,
 } from './transform.js';
 export { transformOpenAIChatCompletions } from './openai.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';

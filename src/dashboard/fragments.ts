@@ -1,21 +1,5 @@
-// Server-rendered HTML for the dashboard — htmx polls each fragment and swaps
-// it in; Alpine drives the toast tray only. No client bundle, no build step:
-// the browser receives finished markup from the same process that owns the
-// data, so the HTML and JSON surfaces can't drift.
-//
-// 2026 redesign — goals:
-//   1. LIGHT theme with a flame-orange accent (no dark mode).
-//   2. LAYERED for two audiences: a plain-language answer on top for anyone
-//      who just started the proxy, and the full honesty math one click away
-//      (the "Show the math" drawer) for skeptics / power users.
-//   3. TRANSPARENT by default: every request can be opened to show exactly
-//      which parts of the context became an IMAGE (compressed, lossy) vs which
-//      stayed as TEXT (byte-exact) — and each rendered page can be paired with
-//      the original source text it was made from.
-//
-// The htmx endpoint names, element ids, polling cadences, and the JSON
-// payloads are unchanged from the previous version — this is presentation
-// only. Server code (src/dashboard.ts, src/node.ts) needs no edits.
+// Server-rendered HTML dashboard — htmx polls fragments, Alpine drives the toast tray.
+// Presentation only; server code (src/dashboard.ts, src/node.ts) needs no edits.
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import type {
@@ -28,7 +12,7 @@ import type {
   CurrentSessionPayload,
 } from './types.js';
 
-// ---- tiny helpers --------------------------------------------------------
+// ---- helpers --------------------------------------------------------
 
 export function escapeHtml(s: string | null | undefined): string {
   if (s == null) return '';
@@ -42,7 +26,7 @@ function numFmt(n: number | null | undefined): string {
   return v.toLocaleString('en-US');
 }
 
-/** Compact "12.3k" / "1.2M" formatter for headline numbers. */
+/** "12.3k" / "1.2M" compact formatter for headline numbers. */
 function kFmt(n: number | null | undefined): string {
   const v = Number(n) || 0;
   const a = Math.abs(v);
@@ -65,16 +49,14 @@ function shortPath(p: string | null | undefined): string {
   return parts[parts.length - 1] || p;
 }
 
-// ---- compression toggle (kill switch) + passthrough banner ----------------
+// ---- compression toggle (kill switch) ------------------------------------
 
 export function renderToggleFragment(enabled: boolean): string {
-  // NOTE: the literal strings "PASSTHROUGH MODE", "Disable compression" and
-  // "Enable compression" are asserted by tests — keep them.
+  // NOTE: "PASSTHROUGH MODE", "Disable compression", "Enable compression" are asserted by tests.
   const banner = enabled
     ? ''
     : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Every request goes to Claude unchanged: no images, no savings. Use this to A/B test, or if the upstream API is having problems.</div>`;
-  // The button POSTs the OPPOSITE of the rendered state; every 2s poll
-  // re-renders it with fresh server state, so the value can't go stale.
+  // Button POSTs the OPPOSITE of current state; 2s poll keeps it fresh.
   const confirm = enabled
     ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to Claude, unchanged. Restarting the proxy turns it back on."`
     : '';
@@ -92,11 +74,7 @@ export function renderToggleFragment(enabled: boolean): string {
 
 // ---- compress scope (which models get imaged) ----------------------------
 
-/** Common models shown as one-click chips. NOT a gate — the chip set is the
- *  UNION of this catalog, the env-configured scope, and whatever is active, so
- *  any model the env var enables stays toggleable. Fable 5 reads renders
- *  cleanly; Opus reads them at a tax; Sonnet/Haiku are unvalidated. Labels are
- *  cosmetic. */
+/** Chip catalog — UNION with env scope + active set, so env-var models stay toggleable. Labels are cosmetic. */
 const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'claude-fable-5', label: 'Fable 5' },
   { id: 'claude-opus-4-8', label: 'Opus 4.8' },
@@ -141,14 +119,11 @@ export function renderModelsFragment(
   );
 }
 
-// ---- the layered hero: one plain-language answer --------------------------
+// ---- session hero --------------------------------------------------------
 
-// MUST stay in lockstep with the server-side ASSUMED_INPUT_USD_PER_MTOK in
-// src/dashboard.ts (see that constant's comment for the rate rationale).
+// Must stay in lockstep with ASSUMED_INPUT_USD_PER_MTOK in src/dashboard.ts.
 const INPUT_USD_PER_MTOK = 10.0;
-// Referenced so the constant isn't flagged unused; the dashboard does its own
-// dollar conversion in renderHeaderFragment from the server's pricing block.
-void INPUT_USD_PER_MTOK;
+void INPUT_USD_PER_MTOK; // suppress unused-var; renderHeaderFragment uses the server's pricing block.
 
 export function renderSessionSummaryFragment(data: CurrentSessionPayload): string {
   const measured = data.baselineMeasuredCount ?? 0;
@@ -161,12 +136,10 @@ export function renderSessionSummaryFragment(data: CurrentSessionPayload): strin
       `</div>`
     );
   }
-  // HEADLINE: raw, rate-free TOTAL token reduction (input + output), real
-  // server numbers, one division. Output isn't compressed, so it's added to
-  // BOTH sides (headlining input-only would cherry-pick).
-  const rawActual = data.rawActualTokens ?? 0; // input side, real (in+cc+cr)
-  const rawBaseline = data.rawBaselineTokens ?? 0; // input side, as text (count_tokens)
-  const rawOutput = data.rawOutputTokens ?? 0; // reply (same both sides)
+  // Raw token reduction (no rate weighting); output added to both sides so the % isn't input-only.
+  const rawActual = data.rawActualTokens ?? 0; // real input (in+cc+cr)
+  const rawBaseline = data.rawBaselineTokens ?? 0; // count_tokens baseline
+  const rawOutput = data.rawOutputTokens ?? 0; // reply — same on both sides
   const ppTotal = rawActual + rawOutput;
   const textTotal = rawBaseline + rawOutput;
   const totalPct = textTotal > 0 ? (1 - ppTotal / textTotal) * 100 : 0;
@@ -192,7 +165,7 @@ export function renderSessionSummaryFragment(data: CurrentSessionPayload): strin
   );
 }
 
-// ---- supporting stats + the single "Show the math" drawer ------------------
+// ---- stat strip + "Show the math" drawer ----------------------------------
 
 function mathRow(key: string, val: number | string | undefined, note = ''): string {
   const v = typeof val === 'number' ? numFmt(val) : String(val ?? '-');
@@ -203,8 +176,7 @@ function mathBlock(title: string, body: string): string {
   return `<section class="math-block"><h4>${title}</h4><div class="formula">${body}</div></section>`;
 }
 
-/** One supporting stat tile. `tip` (optional) adds a hover "?" explainer so a
- *  newcomer gets plain language without the math drawer. */
+/** Stat tile; `tip` adds a hover "?" explainer. */
 function statTile(
   label: string,
   value: string,
@@ -226,7 +198,7 @@ function statTile(
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
 
-  // --- the supporting stat strip (plain language, with hover tooltips) ---
+  // stat strip
   const splitReady = s.split_sufficient_sample;
   const cAvg = s.compressed_avg_usd_per_request ?? 0;
   const pAvg = s.passthrough_avg_usd_per_request ?? 0;
@@ -266,7 +238,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     costTile +
     `</div>`;
 
-  // --- the math drawer: every formula + honesty caveat, one click away ----
+  // math drawer
   const savedMath =
     `<div><span class="k">formula:</span> <span class="v">saved = baseline − actual</span></div>` +
     `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_create×1.25, cache_read×0.10</span></div>` +
@@ -335,22 +307,22 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     mathBlock('Token-equivalent (what the weekly cap counts)', tokeqMath) +
     `</div></details>`;
 
-  // The port is surfaced here (tests assert the header fragment contains it).
+  // NOTE: tests assert the header fragment contains the port number.
   const updated = `<div class="updated"><span class="live-dot"></span>live · port ${port} · uptime ${formatDuration(s.uptime_sec)}</div>`;
 
   return strip + drawer + updated;
 }
 
-// ---- request "x-ray": which parts became images vs stayed text ------------
+// ---- request x-ray (image vs text breakdown) -----------------------------
 
 export interface ContextMapData {
-  id: number; // first image id for this request (matches the recent-table link)
-  baselineTokens: number; // count_tokens of the body as text
-  realInput: number; // input + cache_create + cache_read (server-measured)
+  id: number; // first image id (matches recent-table link)
+  baselineTokens: number; // count_tokens as plain text
+  realInput: number; // input + cache_create + cache_read
   output: number;
   imageCount: number;
-  buckets: Partial<Record<string, number>>; // bucket -> exact chars rendered to PNG
-  imageIds: number[]; // every rendered page's image-ring id, for the gallery
+  buckets: Partial<Record<string, number>>; // bucket → chars rendered to PNG
+  imageIds: number[]; // image-ring ids for the gallery
   compressed: boolean;
 }
 
@@ -363,8 +335,7 @@ const CTXMAP_BUCKETS: ReadonlyArray<readonly [string, string]> = [
   ['history', 'Older conversation turns'],
 ];
 
-/** The image-vs-text breakdown for one request: real token flow plus an exact
- *  split of what became images (lossy) vs what stayed text (byte-exact). */
+/** Image-vs-text breakdown for one request. */
 export function renderContextMapFragment(
   c: ContextMapData | undefined,
   history: ContextMapData[] = [],
@@ -431,7 +402,7 @@ export function renderContextMapFragment(
   );
 }
 
-// ---- recent requests table ------------------------------------------------
+// ---- recent requests table -----------------------------------------------
 
 function statusCls(status: number): string {
   if (status >= 500) return 'bad';
@@ -485,16 +456,13 @@ export function renderRecentFragment(p: RecentPayload): string {
   );
 }
 
-// ---- image ↔ source inspector ---------------------------------------------
+// ---- image ↔ source inspector --------------------------------------------
 
 export interface LatestFragmentInput {
   payload: RecentPayload;
-  /** pinned image id, or null to follow the latest render */
-  pin: number | null;
-  /** render the source-text pane inline */
+  pin: number | null; // pinned image id, or null to follow latest
   showSource: boolean;
-  /** resolved source text for the displayed image; null = not captured */
-  sourceText: string | null;
+  sourceText: string | null; // null = not captured
 }
 
 export function renderLatestFragment(inp: LatestFragmentInput): string {
@@ -504,7 +472,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
   const imageIds = payload.image_ids ?? [];
   const pinnedEvicted = pin != null && !imageIds.includes(pin);
 
-  // The image src — pinned id, or the latest (cache-busted by meta).
+  // Pinned id, or latest (cache-busted by meta).
   const imgSrc =
     pin != null
       ? `/proxy-latest-png?id=${pin}`
@@ -519,8 +487,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
   if (pin != null && pinnedEvicted) {
     main = `<div class="evicted">image #${pin} is no longer in the buffer</div>`;
   } else if (pin != null || hasPreview) {
-    // When the source pane is open we show the image inside the side-by-side
-    // pairing instead, so don't duplicate it here.
+    // When source pane is open the image appears inside the pairing — don't duplicate it.
     main = showSource ? '' : `<div class="frame"><img src="${imgSrc}" alt="rendered page" /></div>`;
   } else {
     main = `<div class="empty-note">No images yet — they appear the instant pxpipe compresses a request.</div>`;
@@ -548,7 +515,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
   return pinBar + main + `<div class="viewer-caption">${caption} ${srcBtn}</div>` + pane;
 }
 
-// ---- sessions bar chart ---------------------------------------------------
+// ---- sessions bar chart --------------------------------------------------
 
 const TOP_N = 8;
 
@@ -590,7 +557,7 @@ export function renderSessionsFragment(p: SessionsPayload): string {
   );
 }
 
-// ---- full-history stats table ---------------------------------------------
+// ---- full-history stats table --------------------------------------------
 
 export function renderStatsTableFragment(p: FullStatsPayload): string {
   if (p.error || !p.summary) {
@@ -604,7 +571,7 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
   const charRatio =
     s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
 
-  // NOTE: the literal word "requests" is asserted by tests — keep it.
+  // NOTE: the literal word "requests" is asserted by tests.
   const tr = (k: string, v: string) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`;
   return (
     `<div class="status">${numFmt(p.parsed)} events parsed from disk</div>` +
@@ -650,7 +617,7 @@ const CSS = `
   .good { color: var(--good); } .bad { color: var(--bad); }
   .muted { color: var(--muted); }
 
-  /* top bar */
+  /* topbar */
   .topbar { display: flex; align-items: flex-start; justify-content: space-between;
     gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
   .brand { display: flex; align-items: center; gap: 12px; }
@@ -661,7 +628,7 @@ const CSS = `
   .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
   .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 
-  /* toggle / kill switch */
+  /* kill switch */
   .banner { display: block; margin: 0 0 8px; padding: 9px 13px; background: var(--bad-tint);
     border: 1px solid #f3b6af; border-radius: 9px; color: #9c2b20; font-size: 12px; max-width: 520px; }
   .banner strong { color: #8a2117; }
@@ -677,7 +644,7 @@ const CSS = `
   .switch-btn:hover { border-color: var(--flame); color: var(--flame-ink); }
   .hint { color: var(--muted); font-size: 11px; }
 
-  /* compress-scope chips */
+  /* model chips */
   .models { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
   .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
   .chip { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
@@ -686,7 +653,7 @@ const CSS = `
   .chip.on { background: var(--flame-tint); color: var(--flame-ink); border-color: var(--flame);
     font-weight: 600; }
 
-  /* hero */
+  /* session hero */
   #frag-session { display: block; margin-bottom: 16px; }
   .hero { background: linear-gradient(135deg, #fff8f4, var(--surface) 60%); border: 1px solid var(--border);
     border-left: 4px solid var(--flame); border-radius: var(--radius); padding: 20px 24px; box-shadow: var(--shadow); }
@@ -705,7 +672,7 @@ const CSS = `
     border-top: 1px dashed var(--border-strong); }
   .hero-empty .hero-headline { color: var(--muted); font-size: 24px; }
 
-  /* supporting stat strip */
+  /* stat strip */
   .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
   @media (max-width: 1000px) { .strip { grid-template-columns: repeat(2, 1fr); } }
   @media (max-width: 560px) { .strip { grid-template-columns: 1fr; } }
@@ -722,7 +689,7 @@ const CSS = `
     border-radius: 50%; background: var(--surface-2); border: 1px solid var(--border-strong);
     color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; }
 
-  /* math drawer */
+  /* drawer */
   .drawer { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
   .drawer > summary { cursor: pointer; user-select: none; list-style: none; padding: 12px 16px;
@@ -747,7 +714,7 @@ const CSS = `
   .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); animation: pulse 2s infinite; }
   @keyframes pulse { 50% { opacity: 0.35; } }
 
-  /* sections + cards */
+  /* sections */
   .section { margin-top: 26px; }
   .section-head { font-size: 14px; font-weight: 700; color: var(--ink); margin: 0 0 12px;
     display: flex; align-items: baseline; gap: 10px; }
@@ -758,11 +725,11 @@ const CSS = `
     color: var(--muted); margin: 0 0 12px; }
   .card-head.spaced { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
 
-  /* x-ray two-column */
+  /* x-ray */
   .xray { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; align-items: start; }
   @media (max-width: 1000px) { .xray { grid-template-columns: 1fr; } }
 
-  /* context map (image vs text) */
+  /* context map */
   .ctxmap { font-size: 13px; }
   .empty-note { color: var(--muted); font-size: 12.5px; padding: 14px; background: var(--surface-2);
     border: 1px dashed var(--border-strong); border-radius: 10px; }
@@ -801,7 +768,7 @@ const CSS = `
   .page.page-gone { width: 150px; height: 56px; background: var(--surface-2); border: 1px dashed var(--border-strong);
     color: var(--muted); font-size: 10px; cursor: default; }
 
-  /* recent table */
+  /* recent requests */
   .row-view { color: var(--flame-ink); font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
   .row-view:hover { text-decoration: underline; }
   table.rtable, table.dtable { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -881,13 +848,7 @@ const CSS = `
     line-height: 1; padding: 0; }
 `;
 
-// Glue between htmx swaps and the page's two bits of client state:
-//   - window.pp: image-pin + source-pane state, sent to /fragments/latest as
-//     query params via hx-vals. ppPin/ppSource mutate it and force an
-//     immediate refresh instead of waiting for the next 2s tick.
-//   - <details> open state: innerHTML swaps would close the math drawer on
-//     every poll; record open ids before the swap and restore them after.
-//   - toasts: htmx request errors are pushed into the Alpine tray.
+// Client glue: window.pp (pin+source state) → hx-vals; preserves <details> open state across swaps; routes htmx errors to toast tray.
 const GLUE_JS = `
   window.pp = { pin: null, src: false };
   function ppPin(id) {
@@ -922,8 +883,7 @@ const GLUE_JS = `
 `;
 
 export function renderPage(port: number): string {
-  // Each fragment div polls its own endpoint. `hx-trigger="load, every Ns"`
-  // paints on page load then keeps the cadence (2s live, 5s slow aggregates).
+  // hx-trigger="load, every Ns": paint on load then poll (2s live, 5s aggregates).
   return `<!doctype html>
 <html lang="en">
 <head>

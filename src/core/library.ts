@@ -1,10 +1,22 @@
 import { isPxpipeSupportedModel } from './applicability.js';
 import { countCacheControlMarkers } from './measurement.js';
-import { transformRequest, type TransformInfo, type TransformOptions } from './transform.js';
+import {
+  transformRequest,
+  type TransformInfo,
+  type TransformOptions,
+  type KeepSharpBlock,
+  type RecoverableBlock,
+} from './transform.js';
+
+export type { KeepSharpBlock, RecoverableBlock };
 
 export type BytesLike = Uint8Array | ArrayBuffer | ArrayBufferView;
 
-export interface PxpipeOptions extends Pick<TransformOptions, 'charsPerToken' | 'historyAmortizationHorizon'> {
+export interface PxpipeOptions
+  extends Pick<
+    TransformOptions,
+    'charsPerToken' | 'historyAmortizationHorizon' | 'keepSharp' | 'emitRecoverable'
+  > {
   /** Test/debug-only bypass. Product hosts should prefer their dashboard setting. */
   readonly compress?: boolean;
 }
@@ -73,10 +85,8 @@ function classifyReason(info: TransformInfo): PxpipeReason {
 }
 
 /**
- * Library-first wrapper around pxpipe's Anthropic Messages transformer.
- * It performs the Opus-4.6/4.7-only model gate, returns machine-readable reasons,
- * and reports cache_control ownership so hosts such as ocproxy do not stack a
- * second cache injector on top of pxpipe's image breakpoint.
+ * Library wrapper for the Anthropic Messages transformer: model gate, machine-readable
+ * reasons, and cache_control ownership flag (prevents hosts stacking a second injector).
  */
 export async function transformAnthropicMessages(
   input: PxpipeTransformInput,

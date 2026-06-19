@@ -1,16 +1,9 @@
 /**
- * Minimal PNG encoder. Grayscale, 8-bit, filter = None, single IDAT.
- *
- * Cross-runtime: uses Web Streams (`CompressionStream`) which exists in:
- *   - Node 18+ (global, no import)
- *   - Cloudflare Workers (built-in)
- *   - Modern browsers
- *
- * No `Buffer`, no `node:zlib` — pure Uint8Array. That's the whole reason
- * this exists instead of `pngjs` or `node-png`.
+ * Minimal PNG encoder (grayscale + RGB, 8-bit, filter=None, single IDAT).
+ * Pure Uint8Array — uses CompressionStream (Node 18+, Workers, browsers); no Buffer/node:zlib.
  */
 
-// ---- CRC32 (PNG spec table) ----------------------------------------------
+// ---- CRC32 ---------------------------------------------------------------
 
 const CRC_TABLE: Uint32Array = (() => {
   const t = new Uint32Array(256);
@@ -28,7 +21,7 @@ function crc32(bytes: Uint8Array): number {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-// ---- Helpers --------------------------------------------------------------
+// ---- Helpers -------------------------------------------------------------
 
 function concat(parts: Uint8Array[]): Uint8Array {
   let total = 0;
@@ -63,12 +56,10 @@ function chunk(type: string, data: Uint8Array): Uint8Array {
 // ---- Deflate via Web Streams ---------------------------------------------
 
 async function deflateZlib(input: Uint8Array): Promise<Uint8Array> {
-  // 'deflate' in CompressionStream is zlib-wrapped (RFC 1950), which is what
-  // PNG IDAT expects. 'deflate-raw' would be RFC 1951 (no header) — wrong.
+  // 'deflate' = RFC 1950 zlib-wrapped — what PNG IDAT needs. 'deflate-raw' (RFC 1951) would be wrong.
   const cs = new CompressionStream('deflate');
   const writer = cs.writable.getWriter();
-  // Cast: TS 5.7 narrows Uint8Array<ArrayBufferLike> away from BufferSource,
-  // but we never use SharedArrayBuffer here so the runtime call is safe.
+  // TS 5.7 narrows Uint8Array<ArrayBufferLike> away from BufferSource; safe since we never use SharedArrayBuffer.
   void writer.write(input as Uint8Array<ArrayBuffer>);
   void writer.close();
 
@@ -86,27 +77,20 @@ async function deflateZlib(input: Uint8Array): Promise<Uint8Array> {
 
 const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-/**
- * Encode a grayscale buffer as PNG bytes.
- *
- * @param pixels  Single-channel coverage, row-major, length = width × height.
- * @param width   Pixel width.
- * @param height  Pixel height.
- */
+/** Encode a single-channel (grayscale) buffer as PNG bytes. pixels is row-major, length = width × height. */
 export async function encodeGrayPng(pixels: Uint8Array, width: number, height: number): Promise<Uint8Array> {
   if (pixels.length !== width * height) {
     throw new Error(`encodeGrayPng: pixels.length=${pixels.length} != ${width}×${height}=${width * height}`);
   }
 
-  // IHDR: width(4) height(4) bitDepth(1) colorType(1=gray) compress(0) filter(0) interlace(0)
+  // IHDR: width(4) height(4) bitDepth=8 colorType=0(gray) compress=0 filter=0 interlace=0
   const ihdr = new Uint8Array(13);
   ihdr.set(u32be(width), 0);
   ihdr.set(u32be(height), 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 0; // color type 0 = grayscale
-  // bytes 10..12 already zero
+  ihdr[8] = 8;
+  ihdr[9] = 0; // colorType 0 = grayscale; bytes 10-12 already zero
 
-  // Add per-scanline filter byte (0 = None) and concat into raw stream
+  // Prepend per-scanline filter byte (0 = None).
   const stride = width + 1;
   const raw = new Uint8Array(stride * height);
   for (let y = 0; y < height; y++) {
@@ -124,26 +108,19 @@ export async function encodeGrayPng(pixels: Uint8Array, width: number, height: n
   ]);
 }
 
-/**
- * Encode an RGB buffer as PNG bytes (color type 2 = truecolor).
- *
- * @param pixels  3 bytes/pixel (R,G,B), row-major, length = width × height × 3.
- * @param width   Pixel width.
- * @param height  Pixel height.
- */
+/** Encode an RGB (3 bytes/pixel, R,G,B) buffer as PNG bytes (colorType 2 = truecolor). length = width × height × 3. */
 export async function encodeRgbPng(pixels: Uint8Array, width: number, height: number): Promise<Uint8Array> {
   if (pixels.length !== width * height * 3) {
     throw new Error(`encodeRgbPng: pixels.length=${pixels.length} != ${width}×${height}×3=${width * height * 3}`);
   }
 
-  // IHDR: width(4) height(4) bitDepth(1) colorType(1=2 truecolor) ...
   const ihdr = new Uint8Array(13);
   ihdr.set(u32be(width), 0);
   ihdr.set(u32be(height), 4);
   ihdr[8] = 8; // bit depth per channel
-  ihdr[9] = 2; // color type 2 = truecolor RGB
+  ihdr[9] = 2; // colorType 2 = truecolor RGB; bytes 10-12 already zero
 
-  // Per-scanline filter byte (0 = None); 3 bytes per pixel.
+  // Prepend per-scanline filter byte (0 = None).
   const stride = width * 3 + 1;
   const raw = new Uint8Array(stride * height);
   for (let y = 0; y < height; y++) {
@@ -161,13 +138,8 @@ export async function encodeRgbPng(pixels: Uint8Array, width: number, height: nu
   ]);
 }
 
-/**
- * Base64-encode bytes in a way that works in both Node and Workers.
- * `btoa` is global in both, but only accepts binary strings — we hand-roll
- * to avoid the `String.fromCharCode(...big array)` blow-up.
- */
+/** Base64-encode bytes. Chunks to avoid call-stack blow-up from String.fromCharCode(...bigArray). */
 export function bytesToBase64(bytes: Uint8Array): string {
-  // Chunk to avoid maxing call stack on String.fromCharCode(...)
   let binary = '';
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) {

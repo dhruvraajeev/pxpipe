@@ -1,91 +1,42 @@
 /**
  * History-image compression (Variant C).
  *
- * Walks `messages[]` left-to-right tracking open `tool_use_id`s. Identifies
- * the largest **closed-tool-sequence prefix** — the longest run from the
- * head of the conversation that has no straddling `tool_use` references
- * into the live tail. Renders that prefix's text content into one or more
- * PNG image blocks and replaces the prefix with ONE synthetic user message:
+ * Collapses the largest closed-tool-sequence prefix into one synthetic user message
+ * containing 1-N PNG image blocks. The live tail (keepTail turns + any open tool
+ * sequence) stays as text. thinking blocks are dropped from the collapsed range —
+ * only the most-recent assistant-with-tool_use must round-trip bit-perfect, and
+ * that turn is in the live tail by construction.
  *
- *   { role: 'user', content: [
- *     { type: 'text', text: '[Earlier in this conversation:]' },
- *     { type: 'image', source: {...} },           // (1..N images)
- *     { type: 'text', text: '[End of earlier context.]' },
- *   ]}
- *
- * Live tail (the last `keepTail` turns + anything inside an open tool
- * sequence) stays as text. The most-recent assistant turn — the one
- * carrying Opus 4.7's `thinking` signature — is always in the live tail
- * by construction (it's at index `messages.length - 1` when present).
- *
- * The synthesized user message uses `role: 'user'` because Anthropic
- * **forbids `image` blocks inside `role: 'assistant'`** (see
- * `/tmp/pxpipe-history-compression.md` line 14 and `types.ts:58`
- * comments). Self-attribution ("I previously said X") is the price.
- *
- * `thinking` blocks inside the collapsed range are dropped from the
- * rendered text — per the spec's Check 2, only the most-recent
- * assistant-with-tool_use's thinking content must round-trip bit-perfect,
- * and that turn is in the live tail by construction.
- *
- * **Cache-control**: caller controls whether the history-image carries
- * pxpipe's ephemeral breakpoint. This module returns the image blocks
- * unmarked; the caller in `transform.ts` decides placement.
- *
- * Spec source: `/tmp/pxpipe-history-compression.md` Variant C section
- * (round 3, lines 346-364 + check-3 cache-control discussion).
+ * Synthesized message uses role:'user' because Anthropic forbids image blocks inside
+ * role:'assistant'. cache_control placement is left to the caller (transform.ts).
  */
 
 import type { ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
 import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, renderTextToPngsWithCharLimit } from './render.js';
 import { bytesToBase64 } from './png.js';
 
-/** Function predicate signature for the break-even gate. Passed in by the
- *  caller (transform.ts) rather than imported here to keep `src/core/history.ts`
- *  free of a cycle with `src/core/transform.ts`. transform.ts already imports
- *  history.ts to invoke `collapseHistory`; importing back the other way would
- *  create an evaluation-order trap.
- *
- *  IMPORTANT — takes the full `text`, NOT `text.length`. The downstream
- *  `isCompressionProfitable` has two paths: a row-aware path for strings
- *  (matches renderTextToPngs() image budgeting exactly) and a looser
- *  chars-only fallback for numbers (assumes dense lines, no newlines).
- *  History text is *newline-heavy* — `--- role ---` headers, JSON args,
- *  `[tool_use]` / `[tool_result]` labels — so the chars-only estimate
- *  under-predicts image count by ~5-10× and used to let net-losers
- *  through. The 2026-05-19 production -250% savings measurement traces
- *  back to that asymmetry. Always pass the string. */
+/** Break-even gate predicate. Injected by transform.ts to avoid a circular import.
+ *  IMPORTANT: pass the full string, not text.length — the row-aware path in
+ *  isCompressionProfitable must see actual newlines to budget images correctly.
+ *  History text is newline-heavy (headers, JSON args, labels); chars-only
+ *  under-predicts image count ~5-10× and lets net-losers through. */
 export type ProfitableFn = (text: string, cols: number) => boolean;
 
 /** Configuration for history collapse. */
 export interface HistoryCollapseOptions {
-  /** Number of turns at the tail (most recent) to KEEP as text. Default 4. */
+  /** Turns at the tail to keep as text. Default 4. */
   keepTail: number;
-  /** Minimum number of turns in the collapsable prefix before we attempt
-   *  the rolling-window re-roll. Below this, leaving them as text costs
-   *  almost nothing and the cache-amortization math doesn't work. Default 10. */
+  /** Minimum collapsible prefix turns — below this, cache-amortization math doesn't work. Default 10. */
   minCollapsePrefix: number;
-  /** Soft-wrap column count for the renderer. Should match the host's
-   *  configured `cols` so the history image visually matches the system
-   *  image. Default 100. */
+  /** Soft-wrap columns for the renderer; should match host cols. Default 100. */
   cols: number;
-  /** Quantize the collapse boundary onto a fixed grid of this many
-   *  messages. The collapsed prefix only advances in `collapseChunk`-sized
-   *  steps, so the rendered history image stays byte-identical between
-   *  steps and keeps hitting Anthropic's prompt cache instead of forcing a
-   *  fresh `cache_create` (1.25x) of the whole prefix on every single turn.
-   *  Set to 0 for the legacy per-turn moving boundary. Default 50. */
+  /** Advance the collapse boundary in steps of this many messages so the rendered PNG stays
+   *  byte-identical for collapseChunk turns and keeps hitting Anthropic's prompt cache.
+   *  Set to 0 for a per-turn moving boundary. Default 50. */
   collapseChunk: number;
-  /** Number of leading messages to NEVER collapse. The caller splices the
-   *  system-prompt + tool-docs slab (rendered as images) into the first user
-   *  message BEFORE history collapse runs. If collapse is allowed to sweep
-   *  that message into the history image, `blocksToText` reduces the slab
-   *  images to literal `[image]` placeholders — destroying the system prompt
-   *  and tool docs for the turn — AND the slab's `cache_control` anchor goes
-   *  with it, so every grid-crossing re-render invalidates the whole prefix.
-   *  Protecting the leading slab message keeps it at the front as the stable,
-   *  marked cache anchor; the history image is inserted AFTER it. Default 0
-   *  (legacy: collapse from the head). */
+  /** Leading messages to never collapse. Protects the slab-bearing first user message
+   *  (system-prompt + tool-docs images) so its cache_control anchor stays at the front
+   *  and isn't swept into the history image as [image] placeholders. Default 0. */
   protectedPrefix: number;
 }
 
@@ -107,10 +58,7 @@ export interface HistoryCollapseInfo {
   collapsedImages: number;
   /** Total PNG bytes emitted. */
   collapsedImageBytes: number;
-  /** Total pixel area emitted (`Σ width × height`). Pairs with cold-miss
-   *  cache_create tokens for empirical px/token derivation — same role as
-   *  `info.imagePixels` in TransformInfo, accumulated here so the caller
-   *  can fold history images into the same regression. */
+  /** Total pixel area (Σ width×height) — pairs with cache_create tokens for px/token regression. */
   collapsedImagePixels: number;
   /** Why we didn't collapse — populated only when no collapse happened. */
   reason?:
@@ -127,20 +75,9 @@ export interface HistoryCollapseInfo {
 
 
 /**
- * Compute the largest index `i*` in `[0..messages.length - keepTail - 1]`
- * such that all `tool_use_id`s issued by assistant turns in `[0..i*]` are
- * matched by `tool_result`s also in `[0..i*]`. Returns `-1` if no such
- * boundary exists (i.e. every potential boundary has a tool_use straddling
- * into the live tail).
- *
- * Algorithm: walk left-to-right. Maintain an `openSet` of unmatched
- * tool_use_ids. After processing each message, record the current openSet
- * size. The closed-prefix boundary is the **last** index ≤ cutoff at which
- * openSet was empty AFTER processing.
- *
- * NOTE: this is robust to interleaved tool_use sequences (e.g. two parallel
- * tool calls in one assistant turn followed by two tool_results in the
- * next user turn). The openSet tracking handles that correctly.
+ * Return the last index ≤ cutoffExclusive at which all tool_use_ids are matched
+ * by tool_results in [0..i]. Returns -1 if no closed boundary exists.
+ * Robust to interleaved/parallel tool calls via openSet tracking.
  */
 export function findClosedPrefixBoundary(
   messages: Message[],
@@ -153,8 +90,7 @@ export function findClosedPrefixBoundary(
   for (let i = 0; i < limit; i++) {
     const msg = messages[i]!;
     if (!Array.isArray(msg.content)) {
-      // Plain string content — no tool blocks possible. Just close-or-stay.
-      if (openSet.size === 0) lastClosed = i;
+      if (openSet.size === 0) lastClosed = i; // plain string — no tool blocks
       continue;
     }
     if (msg.role === 'assistant') {
@@ -178,13 +114,9 @@ export function findClosedPrefixBoundary(
 }
 
 /**
- * Linearise a content-block array to a single string for OCR. Drops
- * `thinking` blocks (Opus 4.7+ only requires bit-perfect on the most-recent
- * assistant-with-tool_use, which is in the live tail by construction).
- * Tool-use input args and tool-result content are included so the model
- * has full context. Inline images and tool_result images are reduced to a
- * `[image]` placeholder — embedding them in the history image would
- * double-encode for no benefit.
+ * Linearise content blocks to a single string. Drops thinking blocks (only the
+ * most-recent assistant turn needs bit-perfect thinking, and it's in the live tail).
+ * Inline images collapse to [image] to avoid double-encoding.
  */
 export function blocksToText(content: string | ContentBlock[]): string {
   if (typeof content === 'string') return content;
@@ -198,13 +130,7 @@ export function blocksToText(content: string | ContentBlock[]): string {
         break;
       case 'tool_use': {
         const tu = blk as ToolUseBlock;
-        // Render as a labelled block so the model can re-attribute. Args
-        // are serialised COMPACT (no 2-space indent) — pretty-printing
-        // bloats the history text ~5× via per-field newlines, which
-        // multiplies image cost since the renderer is row-aware and
-        // every JSON field gets its own row. Compact JSON wraps at
-        // `cols` like normal text, packing ~15.6k chars per single-col
-        // image at the 7×10 cell instead of one short line per field.
+        // Compact JSON (no indent) — pretty-printing bloats text ~5× and the renderer is row-aware.
         let argsStr: string;
         try {
           argsStr = JSON.stringify(tu.input);
@@ -249,11 +175,7 @@ export function blocksToText(content: string | ContentBlock[]): string {
   return parts.join('\n\n');
 }
 
-/**
- * Serialize messages `[0..upToExclusive]` to a single OCR-friendly text
- * blob. Each turn is prefixed with `--- role ---` so the model can parse
- * the conversation back out. Empty turns are skipped.
- */
+/** Serialize messages [fromInclusive..upToExclusive) to a text blob with `--- role ---` headers. */
 export function messagesToHistoryText(
   messages: Message[],
   upToExclusive: number,
@@ -271,15 +193,9 @@ export function messagesToHistoryText(
 }
 
 /**
- * Attempt to collapse a closed-prefix run of `messages` into one synthetic
- * user message containing 1+ history images. Returns the rewritten
- * messages array (a new array; original is not mutated) and telemetry.
- *
- * On any "do not collapse" path (no prefix, too few turns, not profitable,
- * empty render), returns the original messages unchanged with a reason.
- *
- * Caller is responsible for cache_control placement on the returned image
- * blocks — this function returns them with NO `cache_control` set.
+ * Collapse the closed-prefix run into one synthetic user message with 1+ history images.
+ * Returns original messages unchanged on any no-collapse path (reason set in info).
+ * Image blocks are returned with NO cache_control — caller decides placement.
  */
 export async function collapseHistory(
   messages: Message[],
@@ -300,36 +216,15 @@ export async function collapseHistory(
     info.reason = 'no_history';
     return { messages: messages ?? [], info };
   }
-  // Leading messages the caller has marked off-limits (the slab-bearing first
-  // user message — see `protectedPrefix` jsdoc). The collapsed run starts at
-  // this index; everything before it is passed through untouched so the slab
-  // image + its cache_control anchor stay at the front of the request.
+  // Protected leading messages (slab) pass through untouched; collapse starts after them.
   const protectedPrefix = Math.max(
     0,
     Math.min(o.protectedPrefix ?? 0, messages.length),
   );
-  // The live tail must contain at least `keepTail` messages. The boundary
-  // search cuts off at `len - keepTail` so the tail is always preserved.
-  //
-  // Quantize that cutoff onto a fixed grid of `collapseChunk` messages.
-  // A moving boundary re-renders the history image — and changes its PNG
-  // bytes — on every turn, which misses Anthropic's prompt cache and
-  // forces a full `cache_create` (1.25x) of the whole prefix every turn.
-  // Snapping to a grid keeps the collapsed prefix — and thus the rendered
-  // image — byte-identical for `collapseChunk` turns at a stretch, so the
-  // history image caches like Claude Code's native byte-stable history.
+  // Snap the cutoff to a collapseChunk grid so the rendered PNG stays byte-identical
+  // across turns and keeps hitting Anthropic's prompt cache. See docs/HISTORY_CACHE_MODEL.md.
+  // Floor at minCollapsePrefix + protectedPrefix so short histories still collapse.
   const rawCutoff = messages.length - o.keepTail;
-  // Snap the cutoff to the grid, but never below `minCollapsePrefix` turns of
-  // ACTUAL collapsible content — i.e. `minCollapsePrefix + protectedPrefix`,
-  // since the protected leading message(s) sit inside `[0..cutoff)` but are
-  // excluded from the collapse. Without the `+ protectedPrefix` term a small
-  // conversation could never reach `minCollapsePrefix` collapsible turns (the
-  // protected slab would always eat one slot). A conversation shorter than one
-  // full `collapseChunk` would otherwise floor straight to 0 and skip history
-  // compression entirely. Flooring keeps the boundary — and therefore the
-  // rendered image — byte-stable (the prefix is append-only, so its first
-  // messages never change) while still collapsing short histories. Clamp to
-  // `rawCutoff` so a floor can never reach past the live tail.
   const cutoff =
     o.collapseChunk > 0
       ? Math.min(
@@ -345,34 +240,25 @@ export async function collapseHistory(
     info.reason = 'no_closed_prefix';
     return { messages, info };
   }
-  // boundary is the last index INCLUDED in the collapse. `findClosedPrefixBoundary`
-  // guarantees `[0..boundary]` is tool-closed; the protected prefix is itself
-  // tool-closed (the slab message carries no tool_use), so the collapsed range
-  // `[protectedPrefix..boundary]` is closed too. Need at least
-  // `minCollapsePrefix` turns in that range to bother (cache-amortization math
-  // from round-3 only works at scale; collapsing 2-3 turns is net cost).
+  // Need at least minCollapsePrefix turns in [protectedPrefix..boundary] — collapsing
+  // 2-3 turns is net cost (cache-amortization math doesn't work at small scale).
   const collapseLen = boundary + 1;
   if (collapseLen - protectedPrefix < o.minCollapsePrefix) {
     info.reason = 'prefix_too_short';
     return { messages, info };
   }
-  // Serialize and gate on break-even. Start at `protectedPrefix` so the slab
-  // message is excluded — never re-imaged into the history blob as `[image]`.
+  // Exclude slab messages (protectedPrefix) from serialization.
   const text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
   if (!text || text.length === 0) {
     info.reason = 'render_empty';
     return { messages, info };
   }
-  // Row-aware: pass the string, not its length. See ProfitableFn jsdoc.
-  if (!isProfitable(text, o.cols)) {
+  if (!isProfitable(text, o.cols)) { // pass string, not length — see ProfitableFn
     info.reason = 'not_profitable';
     info.collapsedChars = text.length; // surface what we DIDN'T compress
     return { messages, info };
   }
-  // Render. No cache_control here — caller decides placement.
-  // Dense history is user-visible context, not the static system-slab cache
-  // anchor. Render it with the readable dense profile instead of the 313-col
-  // full-canvas profile; otherwise lockfiles/code/config collapse into pixel mush.
+  // Use the dense readable profile (not full-canvas) to keep code/config legible.
   const imgs = await renderTextToPngsWithCharLimit(text, DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
   if (imgs.length === 0) {
     info.reason = 'render_empty';
@@ -395,7 +281,6 @@ export async function collapseHistory(
       info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
     }
   }
-  // Build the synthetic user message.
   const syntheticContent: ContentBlock[] = [
     { type: 'text', text: '[Earlier in this conversation:]' },
     ...imageBlocks,
@@ -410,8 +295,6 @@ export async function collapseHistory(
   info.collapsedTurns = collapseLen - protectedPrefix;
   info.collapsedChars = text.length;
   info.collapsedImages = imageBlocks.length;
-  // [...protected slab message(s), synthetic history image, ...live tail].
-  // The slab stays at the front carrying its cache_control anchor; the history
-  // image sits AFTER it, so a history re-render never invalidates the slab.
+  // [slab, history image, live tail] — slab cache_control anchor stays at the front.
   return { messages: [...head, syntheticUser, ...tail], info };
 }
