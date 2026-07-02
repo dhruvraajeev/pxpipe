@@ -185,7 +185,6 @@ interface ResponsesFlatTool {
 interface OpenAIResolvedOptions {
   compress: boolean;
   compressTools: boolean;
-  compressSchemas: boolean;
   minCompressChars: number;
   cols: number;
   multiCol: number;
@@ -198,7 +197,6 @@ interface OpenAIResolvedOptions {
 const DEFAULTS: OpenAIResolvedOptions = {
   compress: true,
   compressTools: true,
-  compressSchemas: true,
   minCompressChars: 2000,
   cols: DEFAULT_GPT_STRIP_COLS,
   multiCol: 1,
@@ -211,7 +209,6 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   return {
     compress: opts.compress ?? DEFAULTS.compress,
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
-    compressSchemas: opts.compressSchemas ?? DEFAULTS.compressSchemas,
     minCompressChars: opts.minCompressChars ?? DEFAULTS.minCompressChars,
     cols: opts.cols ?? DEFAULTS.cols,
     multiCol: opts.multiCol ?? DEFAULTS.multiCol,
@@ -321,26 +318,30 @@ function isFlatFunctionTool(tool: unknown): tool is ResponsesFlatTool {
   );
 }
 
-function renderToolDoc(tool: OpenAIFunctionTool, includeSchema: boolean): string {
+/** Full doc (prose + compact schema JSON) for one tool. On this path the docs are
+ *  IMAGED, so carrying the schema here is compression, not duplication: the imaged
+ *  copy keeps param docs readable while tools[] ships the stripped skeleton.
+ *  (Contrast transform.ts renderToolDoc: text reference → prose only.) */
+function renderToolDoc(tool: OpenAIFunctionTool): string {
   const f = tool.function;
   const parts = [`## Tool: ${f.name ?? '?'}`];
   if (typeof f.description === 'string' && f.description.length > 0) parts.push(f.description);
-  if (includeSchema && f.parameters !== undefined) {
+  if (f.parameters !== undefined) {
     parts.push('```json\n' + JSON.stringify(f.parameters) + '\n```');
   }
   return parts.join('\n');
 }
 
-function renderFlatToolDoc(tool: ResponsesFlatTool, includeSchema: boolean): string {
+function renderFlatToolDoc(tool: ResponsesFlatTool): string {
   const parts = [`## Tool: ${tool.name ?? '?'}`];
   if (typeof tool.description === 'string' && tool.description.length > 0) parts.push(tool.description);
-  if (includeSchema && tool.parameters !== undefined) {
+  if (tool.parameters !== undefined) {
     parts.push('```json\n' + JSON.stringify(tool.parameters) + '\n```');
   }
   return parts.join('\n');
 }
 
-function rewriteToolsForGpt(tools: unknown[] | undefined, compressSchemas: boolean): {
+function rewriteToolsForGpt(tools: unknown[] | undefined): {
   tools: unknown[] | undefined;
   docs: string;
 } {
@@ -349,8 +350,8 @@ function rewriteToolsForGpt(tools: unknown[] | undefined, compressSchemas: boole
   let changed = false;
   const rewritten = tools.map((tool) => {
     if (!isFunctionTool(tool)) return tool;
-    docs.push(renderToolDoc(tool, compressSchemas));
-    if (!compressSchemas || tool.function.parameters === undefined) return tool;
+    docs.push(renderToolDoc(tool));
+    if (tool.function.parameters === undefined) return tool;
     changed = true;
     return {
       ...tool,
@@ -363,7 +364,7 @@ function rewriteToolsForGpt(tools: unknown[] | undefined, compressSchemas: boole
   return { tools: changed ? rewritten : tools, docs: docs.join('\n\n') };
 }
 
-function rewriteFlatToolsForGpt(tools: unknown[] | undefined, compressSchemas: boolean): {
+function rewriteFlatToolsForGpt(tools: unknown[] | undefined): {
   tools: unknown[] | undefined;
   docs: string;
 } {
@@ -372,8 +373,8 @@ function rewriteFlatToolsForGpt(tools: unknown[] | undefined, compressSchemas: b
   let changed = false;
   const rewritten = tools.map((tool) => {
     if (!isFlatFunctionTool(tool)) return tool;
-    docs.push(renderFlatToolDoc(tool, compressSchemas));
-    if (!compressSchemas || tool.parameters === undefined) return tool;
+    docs.push(renderFlatToolDoc(tool));
+    if (tool.parameters === undefined) return tool;
     changed = true;
     return {
       ...tool,
@@ -605,7 +606,7 @@ export async function transformOpenAIChatCompletions(
   }
 
   const { tools: rewrittenTools, docs: toolDocs } = o.compressTools
-    ? rewriteToolsForGpt(req.tools, o.compressSchemas)
+    ? rewriteToolsForGpt(req.tools)
     : { tools: req.tools, docs: '' };
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
@@ -812,7 +813,7 @@ export async function transformOpenAIResponses(
   }
 
   const { tools: rewrittenTools, docs: toolDocs } = o.compressTools
-    ? rewriteFlatToolsForGpt(req.tools, o.compressSchemas)
+    ? rewriteFlatToolsForGpt(req.tools)
     : { tools: req.tools, docs: '' };
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');

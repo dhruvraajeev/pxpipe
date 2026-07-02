@@ -584,12 +584,15 @@ describe('transformRequest history compression (always-on)', () => {
     expect(slabMsg.role).toBe('user');
     const slabImgs = slabMsg.content.filter((b: { type: string }) => b.type === 'image');
     expect(slabImgs.length).toBeGreaterThanOrEqual(1);
-    // The cache anchor relocates onto the history image (the last imaged block
-    // in prefix order), so the slab image no longer carries it after a collapse.
-    expect(slabImgs.some((b: { cache_control?: unknown }) => b.cache_control !== undefined)).toBe(false);
+    // FIRST collapse: the range [1..11) fits in one freeze window, so no
+    // byte-frozen carry-over chunk exists yet. The anchor stays on the
+    // byte-stable slab image — relocating onto the still-growing history image
+    // would pin the breakpoint to volatile bytes and force the one-time ~53k
+    // full-prefix rewrite (see 'FIRST COLLAPSE' e2e test).
+    expect(slabImgs.some((b: { cache_control?: unknown }) => b.cache_control !== undefined)).toBe(true);
 
-    // The synthetic history image is at messages[1], AFTER the slab anchor, and
-    // now holds the sole relocated cache_control breakpoint.
+    // The synthetic history image is at messages[1], AFTER the slab anchor,
+    // and carries no relocated marker on a first collapse.
     expect(reparsed.messages[1].role).toBe('user');
     const content = reparsed.messages[1].content;
     expect(Array.isArray(content)).toBe(true);
@@ -598,7 +601,7 @@ describe('transformRequest history compression (always-on)', () => {
     expect(content[content.length - 1]).toMatchObject({ type: 'text' });
     expect((content[content.length - 1] as { text: string }).text).toContain('current request is the live text');
     const histImgs = content.filter((b: { type: string }) => b.type === 'image');
-    expect(histImgs[histImgs.length - 1].cache_control).toBeDefined();
+    expect(histImgs.every((b: { cache_control?: unknown }) => b.cache_control === undefined)).toBe(true);
   });
 
   it('sets historyReason=no_closed_prefix when an open tool_use precedes the tail', async () => {
@@ -688,14 +691,23 @@ describe('transformRequest history compression (always-on)', () => {
     expect(explicit20.info.collapsedTurns).toBe(10);
   });
 
-  it('relocates the sole cache anchor onto the last history image (one stable prefix, no added marker)', async () => {
+  it('relocates the sole cache anchor onto the byte-frozen carry-over history image (one stable prefix, no added marker)', async () => {
     // Why: the history image sits AFTER the slab in prefix order. Anchoring the
     // single breakpoint on it caches slab + history as ONE stable segment
     // (created once, then read). Left unanchored, the history image only caches
     // when the caller's roaming downstream marker lands after it — otherwise the
     // largest block re-creates at 1.25x every turn.
+    //
+    // Relocation requires a byte-frozen carry-over chunk to pin to (first-collapse
+    // fixtures keep the anchor on the slab — see the keepTail=4 test above). With
+    // defaults (protectedPrefix 1, collapseChunk 50, freezeChunk 10, keepTail 4),
+    // the cutoff SNAPS to the collapseChunk grid: rawCutoff = len - 4 must reach 50
+    // or it floors to the minCollapsePrefix clamp (11 → one window → no frozen
+    // chunk → no relocation). 56 messages give rawCutoff ≥ 50 → cutoff 50 →
+    // collapse range [1..50): windows ending at 11/21/31/41 are fully frozen, so
+    // carryOverEnd=41 and the chunk [41..50) is the still-growing tail.
     const msgs: Message[] = [];
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 56; i++) {
       const body = `turn ${i}: ` + bigPlain(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
@@ -709,7 +721,8 @@ describe('transformRequest history compression (always-on)', () => {
       }),
     );
     const { body, info } = await transformRequest(marked);
-    expect(info.collapsedImages).toBeGreaterThanOrEqual(1);
+    expect(info.collapsedTurns).toBe(49);
+    expect(info.collapsedImages).toBeGreaterThanOrEqual(2);
     const reparsed = JSON.parse(new TextDecoder().decode(body));
 
     // Slab images survive but no longer carry the anchor.
@@ -717,13 +730,17 @@ describe('transformRequest history compression (always-on)', () => {
     expect(slabImgs.length).toBeGreaterThanOrEqual(1);
     for (const img of slabImgs) expect(img.cache_control).toBeUndefined();
 
-    // The LAST history image carries the breakpoint; earlier ones do not.
+    // Exactly ONE history image carries the breakpoint, and it is NOT the last
+    // one: the last image belongs to the still-growing chunk whose bytes change
+    // on every window advance (#11 bust). The anchor pins the newest byte-frozen
+    // carry-over image instead.
     const histImgs = reparsed.messages[1].content.filter((b: { type: string }) => b.type === 'image');
-    expect(histImgs.length).toBeGreaterThanOrEqual(1);
-    histImgs.forEach((img: { cache_control?: unknown }, i: number) => {
-      if (i === histImgs.length - 1) expect(img.cache_control).toBeDefined();
-      else expect(img.cache_control).toBeUndefined();
-    });
+    expect(histImgs.length).toBeGreaterThanOrEqual(2);
+    const markedIdxs = histImgs
+      .map((img: { cache_control?: unknown }, i: number) => (img.cache_control !== undefined ? i : -1))
+      .filter((i: number) => i >= 0);
+    expect(markedIdxs).toHaveLength(1);
+    expect(markedIdxs[0]).toBeLessThan(histImgs.length - 1);
 
     // Pure relocation: exactly one cache_control across the whole request — the
     // caller sent one (on the system slab); pxpipe moved it, never added.

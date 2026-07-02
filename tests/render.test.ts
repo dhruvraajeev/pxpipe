@@ -24,6 +24,7 @@ import {
   compactSlabWhitespace,
   SLAB_CHARS_PER_TOKEN,
 } from '../src/core/transform.js';
+import { stripSchemaDescriptions } from '../src/core/schema-strip.js';
 import {
   atlasRank,
   ATLAS_CELL_H,
@@ -741,13 +742,12 @@ describe('transform', () => {
     expect(refHeader).toContain("this user's local proxy");
   });
 
-  it('preserves input_schema structure (properties / required / enum) when compressing', async () => {
-    // Production 400s were traced to the proxy replacing input_schema with a
-    // bare `{ type: 'object' }`, which Anthropic's tool-use validator rejected
-    // when the model tried to actually invoke a tool. The fix preserves the
-    // schema SHELL (type, properties keys, required, enum, items) and only
-    // strips long-form `description` / `title` / `$schema` / `default` /
-    // `examples`. The system-text Tool Reference still carries the original schema.
+  it('passes input_schema through byte-identical when compressing', async () => {
+    // History: the proxy once replaced input_schema with a bare `{type:'object'}`
+    // stub (validator 400s), then with a description-stripped shell + full schema
+    // JSON duplicated into the reference text. Both are gone: on the Anthropic
+    // path the reference is TEXT, so the schema ships exactly once — untouched
+    // in tools[], param descriptions and all. Only the prose description moves.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -758,21 +758,21 @@ describe('transform', () => {
           description: 'Read a file from disk',
           input_schema: {
             type: 'object',
-            description: 'Reads a file', // should be stripped
-            $schema: 'http://json-schema.org/draft-07/schema#', // stripped
+            description: 'Reads a file',
+            $schema: 'http://json-schema.org/draft-07/schema#',
             properties: {
               file_path: {
                 type: 'string',
-                description: 'Absolute path to the file', // stripped
+                description: 'Absolute path to the file',
               },
               mode: {
                 type: 'string',
-                enum: ['read', 'binary'], // preserved
-                description: 'Read mode', // stripped
-                default: 'read', // stripped
+                enum: ['read', 'binary'],
+                description: 'Read mode',
+                default: 'read',
               },
             },
-            required: ['file_path'], // preserved verbatim
+            required: ['file_path'],
           },
         },
         {
@@ -784,9 +784,8 @@ describe('transform', () => {
               command: { type: 'string', description: 'cmd' },
               env: {
                 type: 'object',
-                description: 'env vars', // stripped
+                description: 'env vars',
                 properties: {
-                  // nested properties — descriptions stripped, structure kept
                   PATH: { type: 'string', description: 'path var' },
                 },
               },
@@ -809,65 +808,22 @@ describe('transform', () => {
     const bytes = new TextEncoder().encode(req);
     const { body, info } = await transformRequest(bytes);
     expect(info.compressed).toBe(true);
-    expect(info.reason).toBeUndefined(); // no advisory for these valid schemas
+    expect(info.reason).toBeUndefined();
 
     const out = JSON.parse(new TextDecoder().decode(body));
-
-    // Tool 0 (Read): properties + required preserved; descriptions stripped;
-    // enum preserved.
-    const read = out.tools[0];
-    expect(read.input_schema.type).toBe('object');
-    expect(read.input_schema.description).toBeUndefined();
-    expect(read.input_schema.$schema).toBeUndefined();
-    expect(read.input_schema.required).toEqual(['file_path']);
-    expect(Object.keys(read.input_schema.properties)).toEqual(['file_path', 'mode']);
-    expect(read.input_schema.properties.file_path.type).toBe('string');
-    expect(read.input_schema.properties.file_path.description).toBeUndefined();
-    expect(read.input_schema.properties.mode.enum).toEqual(['read', 'binary']);
-    expect(read.input_schema.properties.mode.default).toBeUndefined();
-
-    // Tool 1 (Bash): nested object + array-of-object both keep their structure.
-    const bash = out.tools[1];
-    expect(bash.input_schema.required).toEqual(['command']);
-    expect(bash.input_schema.properties.env.type).toBe('object');
-    expect(bash.input_schema.properties.env.description).toBeUndefined();
-    expect(bash.input_schema.properties.env.properties.PATH.type).toBe('string');
-    expect(bash.input_schema.properties.env.properties.PATH.description).toBeUndefined();
-    expect(bash.input_schema.properties.files.type).toBe('array');
-    expect(bash.input_schema.properties.files.items.type).toBe('object');
-    expect(bash.input_schema.properties.files.items.required).toEqual(['path']);
-    expect(bash.input_schema.properties.files.items.properties.path.description).toBeUndefined();
+    const orig = JSON.parse(req);
+    // Schemas are identical to what the caller sent — descriptions and all.
+    expect(out.tools[0].input_schema).toEqual(orig.tools[0].input_schema);
+    expect(out.tools[1].input_schema).toEqual(orig.tools[1].input_schema);
+    // Only the prose description is stubbed to cite the reference heading.
+    expect(out.tools[0].description).toContain('"## Tool: Read"');
+    expect(out.tools[1].description).toContain('"## Tool: Bash"');
   });
 
-  it('tool-doc JSON is rendered compact (no whitespace) so cols=100 fill stays dense', async () => {
-    // Regression for the 40%-fill / -69% dashboard reduction crisis: pretty
-    // schemas (indent=2) put each key on its own line, wasting ~70% of cols
-    // at typical widths. Compact form is unambiguous and reads fluently
-    // on one wrapped row. The static slab+tool-docs are rendered into the
-    // image, but we can verify the source serialization by computing what
-    // the renderer would see for a known schema.
-    const schema = {
-      type: 'object',
-      properties: {
-        file_path: { type: 'string' },
-        mode: { type: 'string', enum: ['read', 'binary'] },
-      },
-      required: ['file_path'],
-    };
-    const pretty = JSON.stringify(schema, null, 2);
-    const compact = JSON.stringify(schema);
-    // Compact must be strictly shorter and have far fewer newlines.
-    expect(compact.length).toBeLessThan(pretty.length);
-    expect(compact.split('\n').length).toBe(1);
-    expect(pretty.split('\n').length).toBeGreaterThan(8);
-    // Compact must roundtrip back to the same value (no information loss).
-    expect(JSON.parse(compact)).toEqual(schema);
-  });
-
-  it('flags schemas without properties via info.reason', async () => {
-    // Some tools legitimately ship a bare `{type:'object'}` schema. We fall
-    // back to the legacy stub but tag info.reason so we can spot them in the
-    // events.jsonl when triaging future 400s.
+  it('passes a bare {type:"object"} schema through with no advisory', async () => {
+    // Some tools legitimately ship a bare `{type:'object'}` schema. Passthrough
+    // means there is nothing to stub or flag any more — what the caller sent is
+    // exactly what Anthropic's validator sees.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -877,7 +833,7 @@ describe('transform', () => {
       ],
     });
     const { body, info } = await transformRequest(new TextEncoder().encode(req));
-    expect(info.reason).toBe('schema_no_properties');
+    expect(info.reason).toBeUndefined();
     const out = JSON.parse(new TextDecoder().decode(body));
     expect(out.tools[0].input_schema).toEqual({ type: 'object' });
   });
@@ -896,21 +852,15 @@ describe('transform', () => {
   });
 
   // Snapshot-style tests against real-world Claude Code tool schemas.
-  // These exercise the full preservation contract: type / properties /
-  // required / enum / items / oneOf / anyOf / allOf / $ref / numeric &
-  // string constraints / format. Each case asserts the exact post-strip
-  // shape so a regression in stripSchemaDescriptions surfaces immediately.
-  describe('real-world tool-schema preservation', () => {
+  // These exercise the full preservation contract of stripSchemaDescriptions —
+  // now used ONLY by the GPT path (tools[] ships a stripped skeleton while the
+  // imaged docs carry the full schema; the Anthropic path passes schemas
+  // through untouched): type / properties / required / enum / items / oneOf /
+  // anyOf / allOf / $ref / numeric & string constraints / format. Each case
+  // asserts the exact post-strip shape so a regression surfaces immediately.
+  describe('real-world tool-schema preservation (stripSchemaDescriptions)', () => {
     async function rewriteOne(toolSchema: unknown): Promise<unknown> {
-      const req = JSON.stringify({
-        model: 'claude-3-5-sonnet',
-        messages: [{ role: 'user', content: 'hi' }],
-        system: 'x'.repeat(150000),
-        tools: [{ name: 'T', description: 'd', input_schema: toolSchema }],
-      });
-      const { body } = await transformRequest(new TextEncoder().encode(req));
-      const out = JSON.parse(new TextDecoder().decode(body));
-      return out.tools[0].input_schema;
+      return stripSchemaDescriptions(toolSchema);
     }
 
     it("Read (file_path + optional offset/limit) round-trips correctly", async () => {
@@ -1225,30 +1175,24 @@ describe('transform', () => {
       });
     });
 
-    it('recognises oneOf-rooted schemas as structured (no schema_no_properties flag)', async () => {
+    it('strips descriptions inside oneOf branches while keeping the union shape', async () => {
       // A tool whose root schema is a union has no top-level `properties` but
-      // IS structurally valid — it must NOT be flagged as no-structure.
-      const req = JSON.stringify({
-        model: 'claude-3-5-sonnet',
-        messages: [{ role: 'user', content: 'hi' }],
-        system: 'x'.repeat(150000),
-        tools: [
+      // IS structurally valid — branch structure must survive the strip.
+      const got = await rewriteOne({
+        oneOf: [
           {
-            name: 'UnionTool',
-            description: 'd',
-            input_schema: {
-              oneOf: [
-                { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
-                { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] },
-              ],
-            },
+            type: 'object',
+            properties: { name: { type: 'string', description: 'display name' } },
+            required: ['name'],
+          },
+          {
+            type: 'object',
+            properties: { id: { type: 'integer', description: 'numeric id' } },
+            required: ['id'],
           },
         ],
       });
-      const { body, info } = await transformRequest(new TextEncoder().encode(req));
-      expect(info.reason).toBeUndefined();
-      const out = JSON.parse(new TextDecoder().decode(body));
-      expect(out.tools[0].input_schema).toEqual({
+      expect(got).toEqual({
         oneOf: [
           { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
           { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] },

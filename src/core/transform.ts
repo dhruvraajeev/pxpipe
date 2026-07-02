@@ -39,7 +39,6 @@ import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
-import { stripSchemaDescriptions } from './schema-strip.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
@@ -69,8 +68,6 @@ export interface TransformOptions {
   compress?: boolean;
   /** Move tool descriptions into the same image (and stub the originals). */
   compressTools?: boolean;
-  /** Include full input_schema JSON for each tool. */
-  compressSchemas?: boolean;
   /** Compress large `<system-reminder>` text blocks in the first user message. */
   compressReminders?: boolean;
   /** Compress large tool_result text content across all user messages. */
@@ -128,7 +125,6 @@ export interface TransformOptions {
 const DEFAULTS: Required<TransformOptions> = {
   compress: true,
   compressTools: true,
-  compressSchemas: true,
   compressReminders: true,
   compressToolResults: true,
   minCompressChars: 2000,
@@ -936,35 +932,28 @@ function stripBillingLine(text: string): { kept: string | null; body: string } {
   return { kept: null, body: text };
 }
 
-/** Keys that give Anthropic's validator something to bind against. A stripped schema
- *  with none of these gets the bare `{type:'object'}` stub + schema_no_properties advisory. */
-const SCHEMA_STRUCTURAL_KEYS = [
-  'properties',
-  'patternProperties',
-  'oneOf',
-  'anyOf',
-  'allOf',
-  'items',
-  '$ref',
-  'enum',
-  'const',
-];
-
-function schemaHasStructure(schema: Record<string, unknown>): boolean {
-  for (const k of SCHEMA_STRUCTURAL_KEYS) {
-    if (k in schema) return true;
-  }
-  return false;
+/** Extract the `# Environment` markdown section Claude Code injects into its
+ *  system text (working dir, git state, platform, model ID). It carries no XML
+ *  wrapper, so splitStaticDynamic can't catch it — yet its git-status lines
+ *  change across sessions, and baking them into the slab PNG busts the cross-
+ *  session cache (system_sha8 717f1fce → 5efaa4bb for a one-file edit). Parallel
+ *  to stripBillingLine: `kept` re-enters the system tail as plain text. */
+function stripMarkdownEnvSection(text: string): { kept: string; body: string } {
+  const m = /(?:^|\n)(# Environment\b[\s\S]*?)(?=\n#{1,6}\s|$)/.exec(text);
+  if (!m) return { kept: '', body: text };
+  return {
+    kept: m[1]!.trimEnd(),
+    body: text.slice(0, m.index) + text.slice(m.index + m[0].length),
+  };
 }
 
-/** Build the "## Tool: name\n<desc>\n<schema>" block for one tool. Schema is serialized
- *  compact (no whitespace) — pretty-print wastes 70%+ of horizontal space per key. */
-function renderToolDoc(t: ToolDef, includeSchema: boolean): string {
+/** Build the "## Tool: name\n<desc>" block for one tool. Prose only — the schema
+ *  stays untouched in tools[] on this path (text reference: schema JSON here would
+ *  duplicate the structure the API already receives; the GPT path differs because
+ *  its docs are imaged, see openai.ts renderToolDoc). */
+function renderToolDoc(t: ToolDef): string {
   const parts: string[] = [`## Tool: ${t.name ?? '?'}`];
   if (t.description) parts.push(t.description);
-  if (includeSchema && t.input_schema !== undefined) {
-    parts.push('```json\n' + JSON.stringify(t.input_schema) + '\n```');
-  }
   return parts.join('\n');
 }
 
@@ -1412,7 +1401,10 @@ export async function transformRequest(
   //    - staticText: everything else (cacheable, goes into the image).
   const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
   const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
-  const { kept: billingLine, body: sysBody } = stripBillingLine(rawSysText);
+  const { kept: billingLine, body: sysBodyWithEnv } = stripBillingLine(rawSysText);
+  // Pull the volatile `# Environment` markdown section out BEFORE the
+  // static/dynamic split so per-session git state never reaches the slab image.
+  const { kept: envMarkdown, body: sysBody } = stripMarkdownEnvSection(sysBodyWithEnv);
   const {
     staticText,
     dynamicText,
@@ -1420,7 +1412,7 @@ export async function transformRequest(
     unknownTags,
   } = splitStaticDynamic(sysBody);
   info.staticChars = staticText.length;
-  info.dynamicChars = dynamicText.length;
+  info.dynamicChars = dynamicText.length + envMarkdown.length;
   info.dynamicBlockCount = dynBlocks;
   if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
   // Parse env fields out of the dynamic slab — telemetry only, never mutates.
@@ -1449,33 +1441,15 @@ export async function transformRequest(
   let toolsRewritten: ToolDef[] | undefined;
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
-    let sawSchemaNoProps = false;
     toolsRewritten = req.tools.map((t) => {
-      docs.push(renderToolDoc(t, o.compressSchemas));
-      // Preserve schema structure (type/properties/required/enum/items) for Anthropic's
-      // tool-use validator. Bare {type:'object'} caused 400s on non-interactive turns
-      // where Anthropic deep-validates with no prior tool_use history to short-circuit.
-      let stubSchema: unknown | undefined;
-      if (o.compressSchemas) {
-        if (t.input_schema && typeof t.input_schema === 'object') {
-          const stripped = stripSchemaDescriptions(
-            t.input_schema,
-            0,
-          ) as Record<string, unknown> | null;
-          if (!stripped || typeof stripped !== 'object') {
-            // Should not happen for object input, but be defensive.
-            stubSchema = { type: 'object' };
-            sawSchemaNoProps = true;
-          } else if (schemaHasStructure(stripped)) {
-            stubSchema = stripped;
-          } else {
-            // No structural keys → no parameter contract. Ship bare stub and flag it.
-            stubSchema = { type: 'object' };
-            sawSchemaNoProps = true;
-          }
-        }
-        // input_schema missing entirely → leave field off; don't invent one.
-      }
+      docs.push(renderToolDoc(t));
+      // input_schema passes through UNTOUCHED on this path. The reference text
+      // carries prose only; the schema (structure + param descriptions) already
+      // reaches the API once via tools[]. Stripping here would either lose param
+      // descriptions or force duplicating the schema into the reference — both
+      // strictly worse than leaving it alone. (History: a bare {type:'object'}
+      // stub caused validator 400s; stripped-stub + schema-in-text fixed that but
+      // paid the structure twice. Passthrough pays everything exactly once.)
       return {
         ...t,
         // Wording note (do NOT reintroduce "system prompt"/"authoritative" — same ban
@@ -1485,13 +1459,9 @@ export async function transformRequest(
         // to claude-opus-4-8 immediately on cold start, 2026-07-02). The reference
         // block's own header says where the docs live; the stub only needs the heading.
         description: `ⓘ Full docs: see "## Tool: ${t.name ?? '?'}" in the Tool Reference section.`,
-        ...(stubSchema !== undefined ? { input_schema: stubSchema } : {}),
       };
     });
     toolDocsText = docs.join('\n\n');
-    if (sawSchemaNoProps && !info.reason) {
-      info.reason = 'schema_no_properties';
-    }
   }
 
   // Only the static slab goes into the renderer; dynamic slab and billing line stay
@@ -1638,6 +1608,9 @@ export async function transformRequest(
     const sysTail: SystemField = [];
     if (billingLine) sysTail.push({ type: 'text', text: billingLine });
     if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
+    // Volatile env section rides after the cache anchor as plain text — the
+    // model still sees it; the cached slab image no longer depends on it.
+    if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
     // Tool Reference: full tool docs as plain system text. Stubbed tools[]
     // descriptions cite these "## Tool: <name>" headings verbatim. Emitted only
@@ -1957,7 +1930,16 @@ export async function transformRequest(
       // Move the single cache anchor onto the history image so slab + history
       // cache as one stable prefix (created once, then read), instead of the
       // history image re-creating whenever the caller's downstream marker moves.
-      relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal);
+      //
+      // ONLY when collapseHistory pinned a byte-frozen carry-over chunk. On the
+      // session's FIRST collapse the range fits in one freeze window, no carry-over
+      // exists (ordinal undefined), and relocating would land the anchor on the
+      // newest still-growing history image — a volatile breakpoint that forced a
+      // one-time full-prefix rewrite (~53k tokens/session). Leave the anchor on
+      // the byte-stable slab image until a frozen chunk exists to pin to.
+      if (histInfo.carryOverImageOrdinal !== undefined) {
+        relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal);
+      }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
     }

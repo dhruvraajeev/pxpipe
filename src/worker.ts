@@ -26,7 +26,6 @@ export interface Env {
   OPENAI_API_KEY?: string;
   COMPRESS?: string;
   COMPRESS_TOOLS?: string;
-  COMPRESS_SCHEMAS?: string;
   COMPRESS_REMINDERS?: string;
   COMPRESS_TOOL_RESULTS?: string;
   MIN_COMPRESS_CHARS?: string;
@@ -50,7 +49,6 @@ export default {
     const transform: TransformOptions = {
       compress: truthy(env.COMPRESS, true),
       compressTools: truthy(env.COMPRESS_TOOLS, true),
-      compressSchemas: truthy(env.COMPRESS_SCHEMAS, true),
       compressReminders: truthy(env.COMPRESS_REMINDERS, true),
       compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
       minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,

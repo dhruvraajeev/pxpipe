@@ -132,6 +132,21 @@ function anthropicImages(bodyText: string): { data: string; marked: boolean }[] 
   return out;
 }
 
+/** The first-text-block banner of whichever message holds the marked image,
+ *  or undefined if that message doesn't START with a text block (i.e. the
+ *  marker is on an image-first message = the slab message, NOT the synthetic). */
+function markedBanner(bodyText: string): string | undefined {
+  const b = JSON.parse(bodyText);
+  for (const m of b.messages ?? []) {
+    if (!Array.isArray(m.content)) continue;
+    const marked = m.content.some(
+      (c: any) => c?.type === 'image' && c.cache_control !== undefined,
+    );
+    if (marked) return m.content[0]?.type === 'text' ? m.content[0].text : undefined;
+  }
+  return undefined;
+}
+
 /** GPT chat-completions image data URLs across all messages, in order. */
 function gptChatImages(bodyText: string): string[] {
   const b = JSON.parse(bodyText);
@@ -160,10 +175,19 @@ function gptResponsesImages(bodyText: string): string[] {
 function anthropicBody(opts: {
   model?: string;
   slabChars?: number;
+  /** Appended verbatim to the slab text INSIDE the marked system block —
+   *  used to inject a volatile `# Environment` section next to static content. */
+  sysSuffix?: string;
   turns: { role: 'user' | 'assistant'; text: string }[];
 }): string {
   const system = opts.slabChars
-    ? [{ type: 'text', text: slab(opts.slabChars), cache_control: { type: 'ephemeral' } }]
+    ? [
+        {
+          type: 'text',
+          text: slab(opts.slabChars) + (opts.sysSuffix ?? ''),
+          cache_control: { type: 'ephemeral' },
+        },
+      ]
     : 'short';
   return JSON.stringify({
     model: opts.model ?? 'claude-fable-5',
@@ -304,21 +328,6 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     const capHist = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(120, 4000) }));
     capHist.restore();
 
-    // The first-text-block banner of whichever message holds the marked image,
-    // or undefined if that message doesn't START with a text block (i.e. the
-    // marker is on an image-first message = the slab message, NOT the synthetic).
-    const markedBanner = (bodyText: string): string | undefined => {
-      const b = JSON.parse(bodyText);
-      for (const m of b.messages ?? []) {
-        if (!Array.isArray(m.content)) continue;
-        const marked = m.content.some(
-          (c: any) => c?.type === 'image' && c.cache_control !== undefined,
-        );
-        if (marked) return m.content[0]?.type === 'text' ? m.content[0].text : undefined;
-      }
-      return undefined;
-    };
-
     // Both: exactly one marked image (conserved, never duplicated).
     expect(anthropicImages(capSlab.main[0]!.body).filter((i) => i.marked)).toHaveLength(1);
     expect(anthropicImages(capHist.main[0]!.body).filter((i) => i.marked)).toHaveLength(1);
@@ -331,6 +340,84 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     expect(markedBanner(capSlab.main[0]!.body)).toBeUndefined();
     // History collapsed → marker relocated ONTO the history synthetic image.
     expect(markedBanner(capHist.main[0]!.body)).toBe(HISTORY_SYNTHETIC_INTRO);
+  });
+
+  it('ENV SPLIT: a git-status change in `# Environment` never re-renders the slab image', async () => {
+    // Cross-session cache bust regression: Claude Code injects a `# Environment`
+    // markdown section (working dir, git status, model ID) into the system text
+    // with no XML wrapper. Baked into the slab PNG, a one-file edit flipped
+    // system_sha8 717f1fce → 5efaa4bb and re-created the whole prefix. The fix
+    // (stripMarkdownEnvSection) pulls it out BEFORE the static/dynamic split:
+    // slab bytes must be independent of git state, while the env text still
+    // reaches the model as plain system text after the anchor.
+    const env = (git: string) =>
+      `\n# Environment\nWorking directory: /repo\nPlatform: darwin\nGit status:\n${git}`;
+    const cap1 = await driveAnthropic(
+      anthropicBody({ slabChars: 80_000, sysSuffix: env('clean'), turns: turns(4, 20) }),
+    );
+    cap1.restore();
+    const cap2 = await driveAnthropic(
+      anthropicBody({
+        slabChars: 80_000,
+        sysSuffix: env('modified: src/pricing.ts'),
+        turns: turns(4, 20),
+      }),
+    );
+    cap2.restore();
+
+    // Tail turns identical + no collapse (4 turns < minCollapsePrefix) → every
+    // forwarded image is a slab image. ALL of them must be byte-identical across
+    // the two "sessions" — the env change may not reach the renderer at all.
+    const a = anthropicImages(cap1.main[0]!.body).map((i) => i.data);
+    const b = anthropicImages(cap2.main[0]!.body).map((i) => i.data);
+    expect(a.length).toBeGreaterThan(0);
+    expect(b).toEqual(a);
+
+    // Not dropped: the volatile section re-enters as plain system text, so the
+    // model still sees the current git state.
+    const sysText = (bodyText: string): string => {
+      const sys = JSON.parse(bodyText).system;
+      return Array.isArray(sys) ? sys.map((s: any) => s?.text ?? '').join('\n') : String(sys ?? '');
+    };
+    expect(sysText(cap2.main[0]!.body)).toContain('modified: src/pricing.ts');
+    expect(sysText(cap1.main[0]!.body)).toContain('Git status:\nclean');
+    // And the section left the imaged (cache-marked) region: the marked block is
+    // an image, and no remaining system TEXT block still carries the heading
+    // upstream of the anchor. (Byte-equality above is the load-bearing check;
+    // this pins the mechanism.)
+    expect(sysText(cap2.main[0]!.body)).toContain('# Environment');
+  });
+
+  it('FIRST COLLAPSE (turn-2 rewrite): no frozen chunk yet → anchor stays on the SLAB image', async () => {
+    // With defaults (keepTail 4, minCollapsePrefix 10, freezeChunk 10) and a slab
+    // (protectedPrefix 1), 15 messages give collapse range [1..11) = exactly 10 =
+    // one freeze window → no fully-frozen chunk → carryOverImageOrdinal undefined.
+    // Before the fix, relocateAnchorToHistoryImage ran anyway and pinned the anchor
+    // to the newest STILL-GROWING history image — a volatile breakpoint that forced
+    // a one-time full-prefix rewrite (~53k tokens/session). The anchor must stay on
+    // the byte-stable slab image until a frozen chunk exists to pin to.
+    const cap1 = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(15, 4000) }));
+    cap1.restore();
+    // +2 tail turns: collapseChunk snapping keeps the boundary at 11, so the
+    // history image is unchanged — the cacheable prefix must be byte-stable.
+    const cap2 = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(17, 4000) }));
+    cap2.restore();
+
+    for (const cap of [cap1, cap2]) {
+      const body = cap.main[0]!.body;
+      // Guard against a vacuous pass: collapse really happened.
+      expect(body).toContain(HISTORY_SYNTHETIC_INTRO.slice(0, 40));
+      // Marker conserved…
+      expect(anthropicImages(body).filter((i) => i.marked)).toHaveLength(1);
+      // …and NOT on the history synthetic: the marked message is image-first
+      // (the slab in messages[0]), not the text-banner history message.
+      expect(markedBanner(body)).toBeUndefined();
+    }
+    // The marked image is byte-identical across the advance — the whole point:
+    // the breakpoint sits on frozen bytes, so the prefix cache_reads, not re-creates.
+    const m1 = anthropicImages(cap1.main[0]!.body).find((i) => i.marked)!;
+    const m2 = anthropicImages(cap2.main[0]!.body).find((i) => i.marked)!;
+    expect(m2.data).toBe(m1.data);
   });
 
   it('GATE: an out-of-scope model is forwarded byte-for-byte untouched (no images)', async () => {
