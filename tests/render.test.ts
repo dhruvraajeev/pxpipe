@@ -696,17 +696,18 @@ describe('transform', () => {
     }
   });
 
-  it('moves tool docs to a system-text Tool Reference and stubs originals', async () => {
+  it('moves tool docs into the imaged Tool Reference and stubs originals', async () => {
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
-      // Tool docs no longer feed the image slab, so the static system text
-      // alone must clear the compression gate.
-      system: 'x'.repeat(150000),
+      // Sized so system + tool docs + banner fit inside the 65,536-char
+      // info.imageSourceText diagnostic window (the reference renders after
+      // the static slab) while still clearing the compression gates.
+      system: 'x'.repeat(30000),
       tools: [
         {
           name: 'BigTool',
-          description: 'A very long tool description. '.repeat(5000),
+          description: 'A very long tool description. '.repeat(500),
           input_schema: { type: 'object', properties: { x: { type: 'string' } } },
         },
       ],
@@ -717,41 +718,44 @@ describe('transform', () => {
     expect(info.toolDocsChars).toBeGreaterThan(0);
 
     const out = JSON.parse(new TextDecoder().decode(body));
-    // Stub cites its own heading in the system Tool Reference (link-up contract).
+    // Stub cites its own heading in the imaged Tool Reference (link-up contract).
     expect(out.tools[0].name).toBe('BigTool');
     expect(out.tools[0].description).toContain('"## Tool: BigTool"');
     expect(out.tools[0].description).toContain('Tool Reference');
-    // Full docs land as plain text in the system field, under that exact heading.
-    const sysTexts = (out.system as any[])
+    // Full docs ride the imaged slab — that IS the compression.
+    const imgSrc = info.imageSourceText ?? '';
+    expect(imgSrc).toContain('=== TOOL REFERENCE ===');
+    expect(imgSrc).toContain('## Tool: BigTool');
+    expect(imgSrc).toContain('A very long tool description.');
+    // No text-splice remains in the system field.
+    const sysTexts = ((out.system as any[]) ?? [])
       .filter((b: any) => b.type === 'text')
       .map((b: any) => b.text as string);
-    const ref = sysTexts.find((t) => t.includes('=== TOOL REFERENCE ==='));
-    expect(ref).toBeDefined();
-    expect(ref!).toContain('## Tool: BigTool');
-    expect(ref!).toContain('A very long tool description.');
-    // And the imaged slab no longer carries the tool docs.
-    expect(info.imageSourceText ?? '').not.toContain('A very long tool description.');
+    expect(sysTexts.some((t) => t.includes('=== TOOL REFERENCE ==='))).toBe(false);
     // Classifier regression (169521c; retripped 2026-07-02 by a stub citing "the
     // system prompt"): pxpipe-authored framing must never read as a replayed or
     // extracted prompt. Ban the trigger wording in the stub and the reference
     // header, and require first-party provenance framing on the reference block.
     // Scoped to the header only — quoted tool docs below it are third-party text.
     expect(out.tools[0].description).not.toMatch(/system prompt|authoritative/i);
-    const refHeader = ref!.slice(0, ref!.indexOf('## Tool:'));
+    const refStart = imgSrc.indexOf('=== TOOL REFERENCE ===');
+    const refHeader = imgSrc.slice(refStart, imgSrc.indexOf('## Tool:', refStart));
     expect(refHeader).not.toMatch(/system prompt|authoritative/i);
     expect(refHeader).toContain("this user's local proxy");
   });
 
-  it('passes input_schema through byte-identical when compressing', async () => {
-    // History: the proxy once replaced input_schema with a bare `{type:'object'}`
-    // stub (validator 400s), then with a description-stripped shell + full schema
-    // JSON duplicated into the reference text. Both are gone: on the Anthropic
-    // path the reference is TEXT, so the schema ships exactly once — untouched
-    // in tools[], param descriptions and all. Only the prose description moves.
+  it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
+    // History: a bare `{type:'object'}` stub caused validator 400s; a text
+    // reference paid the annotations at text rates. Current contract: tools[]
+    // keeps the structural contract (type/properties/required/enum) for the
+    // validator, annotations (description/default/$schema) move into the
+    // imaged reference where they cost image rates.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
-      system: 'x'.repeat(150000), // force compression
+      // Small enough that the reference lands inside the 65,536-char
+      // info.imageSourceText window; large enough to clear the gates.
+      system: 'x'.repeat(30000),
       tools: [
         {
           name: 'Read',
@@ -811,11 +815,26 @@ describe('transform', () => {
     expect(info.reason).toBeUndefined();
 
     const out = JSON.parse(new TextDecoder().decode(body));
-    const orig = JSON.parse(req);
-    // Schemas are identical to what the caller sent — descriptions and all.
-    expect(out.tools[0].input_schema).toEqual(orig.tools[0].input_schema);
-    expect(out.tools[1].input_schema).toEqual(orig.tools[1].input_schema);
-    // Only the prose description is stubbed to cite the reference heading.
+    // Structural contract survives in tools[] — validator-visible keys intact.
+    const s0 = out.tools[0].input_schema;
+    expect(s0.type).toBe('object');
+    expect(Object.keys(s0.properties)).toEqual(['file_path', 'mode']);
+    expect(s0.required).toEqual(['file_path']);
+    expect(s0.properties.mode.enum).toEqual(['read', 'binary']);
+    // Annotations are stripped from tools[] everywhere in the tree.
+    expect(JSON.stringify(s0)).not.toContain('description');
+    expect(s0.$schema).toBeUndefined();
+    expect(s0.properties.mode.default).toBeUndefined();
+    const s1 = out.tools[1].input_schema;
+    expect(s1.required).toEqual(['command']);
+    expect(Object.keys(s1.properties.env.properties)).toEqual(['PATH']);
+    expect(s1.properties.files.items.required).toEqual(['path']);
+    expect(JSON.stringify(s1)).not.toContain('description');
+    // The full annotated schema rides the imaged reference instead.
+    const imgSrc = info.imageSourceText ?? '';
+    expect(imgSrc).toContain('Absolute path to the file');
+    expect(imgSrc).toContain('path var');
+    // Stubs cite the reference heading.
     expect(out.tools[0].description).toContain('"## Tool: Read"');
     expect(out.tools[1].description).toContain('"## Tool: Bash"');
   });

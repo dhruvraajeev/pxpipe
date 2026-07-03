@@ -147,3 +147,26 @@ export function stripSchemaDescriptions(node: unknown, depth = 0): unknown {
   }
   return out;
 }
+
+/** JSON Schema keys that carry a parameter *contract* (shape/values), as opposed
+ *  to pure annotations. Used to decide whether a stripped schema still tells the
+ *  validator anything — if none survive, the strip is not worth shipping. */
+export const SCHEMA_STRUCTURAL_KEYS = [
+  'properties',
+  'patternProperties',
+  'oneOf',
+  'anyOf',
+  'allOf',
+  'items',
+  '$ref',
+  'enum',
+  'const',
+] as const;
+
+/** True when the schema node retains at least one structural (contract) key. */
+export function schemaHasStructure(schema: Record<string, unknown>): boolean {
+  for (const k of SCHEMA_STRUCTURAL_KEYS) {
+    if (k in schema) return true;
+  }
+  return false;
+}

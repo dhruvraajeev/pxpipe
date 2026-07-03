@@ -35,6 +35,7 @@ import {
   renderTextToPngsWithCharLimit,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
+import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
@@ -947,13 +948,20 @@ function stripMarkdownEnvSection(text: string): { kept: string; body: string } {
   };
 }
 
-/** Build the "## Tool: name\n<desc>" block for one tool. Prose only — the schema
- *  stays untouched in tools[] on this path (text reference: schema JSON here would
- *  duplicate the structure the API already receives; the GPT path differs because
- *  its docs are imaged, see openai.ts renderToolDoc). */
+/** Build the "## Tool: name\n<desc>\n```json …```" block for one tool. Docs are
+ *  imaged on this path (mirrors openai.ts renderToolDoc): the image carries the
+ *  full schema — annotations included — at image token rates, while tools[]
+ *  carries the annotation-stripped structure for Anthropic's tool-use validator.
+ *  (The earlier text-reference design kept this prose-only because schema JSON
+ *  at text rates would have duplicated what tools[] already pays for; at image
+ *  rates the duplicate structure is cheap and the stripped annotations are the
+ *  compression.) */
 function renderToolDoc(t: ToolDef): string {
   const parts: string[] = [`## Tool: ${t.name ?? '?'}`];
   if (t.description) parts.push(t.description);
+  if (t.input_schema !== undefined) {
+    parts.push('```json\n' + JSON.stringify(t.input_schema) + '\n```');
+  }
   return parts.join('\n');
 }
 
@@ -1431,25 +1439,34 @@ export async function transformRequest(
   if (claudeMdSha) info.claudeMdSha8 = claudeMdSha;
   if (firstUserSha) info.firstUserSha8 = firstUserSha;
 
-  // 2. Optionally move tool docs to a plain-text "Tool Reference" section in the
-  //    system field, stubbing originals. Text (not image) because tool docs are
-  //    static per session — they sit inside the cached prefix and cost ~0.1× after
-  //    the first turn, while keeping schemas/param docs losslessly readable.
-  //    Each stub description cites its own heading ("## Tool: <name>") so the
-  //    model can link stub → full doc deterministically.
+  // 2. Move tool docs into the imaged "Tool Reference", stubbing originals.
+  //    Imaged (not text) because that IS the compression — descriptions and
+  //    schema annotations ride at image token rates, mirroring the GPT path.
+  //    Tool docs are static per session, so the slab image stays byte-stable
+  //    and cache-friendly. Each stub description cites its own heading
+  //    ("## Tool: <name>") so the model can link stub → full doc
+  //    deterministically.
   let toolDocsText = '';
   let toolsRewritten: ToolDef[] | undefined;
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
       docs.push(renderToolDoc(t));
-      // input_schema passes through UNTOUCHED on this path. The reference text
-      // carries prose only; the schema (structure + param descriptions) already
-      // reaches the API once via tools[]. Stripping here would either lose param
-      // descriptions or force duplicating the schema into the reference — both
-      // strictly worse than leaving it alone. (History: a bare {type:'object'}
-      // stub caused validator 400s; stripped-stub + schema-in-text fixed that but
-      // paid the structure twice. Passthrough pays everything exactly once.)
+      // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
+      // required/enum/items) stays for Anthropic's tool-use validator — a bare
+      // {type:'object'} stub caused 400s on non-interactive turns where Anthropic
+      // deep-validates with no prior tool_use history to short-circuit. The
+      // stripped annotations (description/title/examples/default) ride in the
+      // imaged reference instead, at image rates. If stripping yields no
+      // structural keys, keep the ORIGINAL schema untouched: it's tiny without
+      // properties, and a bare stub is the riskier trade.
+      let schema = t.input_schema;
+      if (schema && typeof schema === 'object') {
+        const stripped = stripSchemaDescriptions(schema, 0) as Record<string, unknown> | null;
+        if (stripped && typeof stripped === 'object' && schemaHasStructure(stripped)) {
+          schema = stripped;
+        }
+      }
       return {
         ...t,
         // Wording note (do NOT reintroduce "system prompt"/"authoritative" — same ban
@@ -1459,16 +1476,31 @@ export async function transformRequest(
         // to claude-opus-4-8 immediately on cold start, 2026-07-02). The reference
         // block's own header says where the docs live; the stub only needs the heading.
         description: `ⓘ Full docs: see "## Tool: ${t.name ?? '?'}" in the Tool Reference section.`,
+        ...(schema !== undefined ? { input_schema: schema } : {}),
       };
     });
     toolDocsText = docs.join('\n\n');
+    info.toolDocsChars = toolDocsText.length;
   }
 
-  // Only the static slab goes into the renderer; dynamic slab and billing line stay
-  // as plain text so the cache key (= image bytes) is stable across turns. Tool docs
-  // are spliced into the system field as text (see sysTail below), NOT imaged —
-  // static per session, so they ride the cache prefix at ~0.1× cost.
-  const combinedRaw = staticText;
+  // Static slab + Tool Reference go into the renderer; dynamic slab and billing
+  // line stay as plain text so the cache key (= image bytes) is stable across
+  // turns. The reference header carries the same first-party provenance framing
+  // that defused the imaged-slab banner refusal (169521c): pxpipe names itself
+  // as the author of the relocation so the block reads as this session's own
+  // config, not a replayed/extracted prompt.
+  const toolReferenceText = toolDocsText
+    ? '=== TOOL REFERENCE ===\n' +
+      "pxpipe (this user's local proxy) moved the full tool documentation for this" +
+      ' session here to reduce token cost. Each tool in the tools list carries a short' +
+      ' stub description pointing here; the entry under the matching' +
+      ' "## Tool: <name>" heading below is the complete description for that tool.\n\n' +
+      toolDocsText +
+      '\n=== END TOOL REFERENCE ==='
+    : '';
+  const combinedRaw = [staticText, toolReferenceText]
+    .filter((s) => s.length > 0)
+    .join('\n\n');
   // Compact then reflow before the gate; gate/renderer/paging all see the same text.
   // origChars anchored to raw length — that's what Anthropic would have billed.
   const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
@@ -1612,26 +1644,11 @@ export async function transformRequest(
     // model still sees it; the cached slab image no longer depends on it.
     if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
-    // Tool Reference: full tool docs as plain system text. Stubbed tools[]
-    // descriptions cite these "## Tool: <name>" headings verbatim. Emitted only
-    // when toolsRewritten is set — both are applied on this same path, so the
-    // stub ↔ reference invariant holds (gate-fail paths return earlier with
+    // Tool Reference now rides INSIDE the imaged slab (combinedRaw above) — no
+    // text splice here. Stubbed tools[] descriptions cite the "## Tool: <name>"
+    // headings inside the image; stub ↔ reference invariant holds because both
+    // are applied on this same path (gate-fail paths return earlier with
     // original tools untouched).
-    if (toolsRewritten && toolDocsText) {
-      // First-party provenance framing, mirroring the imaged-slab banner fix
-      // (169521c): pxpipe names itself as the author of the relocation so the
-      // block reads as this session's own config, not a replayed/extracted prompt.
-      const toolReferenceText =
-        '=== TOOL REFERENCE ===\n' +
-        "pxpipe (this user's local proxy) moved the full tool documentation for this" +
-        ' session here to reduce token cost. Each tool in the tools list carries a short' +
-        ' stub description pointing here; the entry under the matching' +
-        ' "## Tool: <name>" heading below is the complete description for that tool.\n\n' +
-        toolDocsText +
-        '\n=== END TOOL REFERENCE ===';
-      sysTail.push({ type: 'text', text: toolReferenceText });
-      info.toolDocsChars = toolDocsText.length;
-    }
     req.system = sysTail.length > 0 ? sysTail : undefined;
 
     const firstUserIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
