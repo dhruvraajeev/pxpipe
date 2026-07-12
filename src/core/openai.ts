@@ -9,6 +9,7 @@
 import {
   renderTextToPngs,
   reflow,
+  neutralizeSentinel,
   shrinkColsToContent,
   renderCellWidth,
   renderCellHeight,
@@ -42,7 +43,7 @@ import {
   type GptHistoryOptions,
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
-import { appendIdsBlock, factSheetText } from './factsheet.js';
+import { factSheetText } from './factsheet.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
@@ -281,9 +282,6 @@ function gptHistoryOpts(
     maxHeightPx: o.gptHistory?.maxHeightPx ?? profile.maxHeightPx,
     style: o.gptHistory?.style ?? profile.style,
     maxImages: o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model),
-    // Production path for every family: isolated IDS rows in the image plus the
-    // adjacent text factsheet. Opt out per request with gptHistory.idsBlock: false.
-    idsBlock: o.gptHistory?.idsBlock ?? true,
   };
 }
 
@@ -302,16 +300,14 @@ function emptyInfo(reason?: string): TransformInfo {
   };
 }
 
-/** Append IDS block so precision tokens get isolated pure-image rows (all models).
- *  Production also attaches factSheetText next to images (see slab/history below).
- *  IDS alone is not enough for Grok exact recall on live multi-seed. */
-function prepareImagedRenderText(text: string): string {
-  return appendIdsBlock(text);
+function prepareImagedRenderText(text: string, reflowEnabled: boolean): string {
+  return maybeReflow(text.trimEnd(), reflowEnabled);
 }
 
 function maybeReflow(text: string, enabled: boolean): string {
   if (!enabled) return text;
-  return reflow(text) ?? text;
+  const safe = neutralizeSentinel(text);
+  return reflow(safe) ?? safe;
 }
 
 function isTextPart(part: unknown): part is OpenAITextPart {
@@ -833,7 +829,7 @@ export async function transformOpenAIChatCompletions(
   const firstUser = firstUserText(req);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
-  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
+  const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   if (combined.length < o.minCompressChars) {
     info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
     return { body, info };
@@ -845,7 +841,7 @@ export async function transformOpenAIChatCompletions(
     ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
     : '';
   const header = CHAT_HEADER.replace('\n====', reflowNote + '\n====');
-  const renderedText = prepareImagedRenderText(header + combined);
+  const renderedText = prepareImagedRenderText(header + combined, o.reflow);
   const profile = resolveGptProfile(req.model);
   const maxCols = o.cols ?? profile.stripCols;
   const cols = Math.min(
@@ -1055,7 +1051,7 @@ export async function transformOpenAIResponses(
   const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
-  const combined = maybeReflow(compactSlabWhitespace(combinedRaw), o.reflow);
+  const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   if (combined.length < o.minCompressChars) {
     info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
     return { body, info };
@@ -1065,7 +1061,7 @@ export async function transformOpenAIResponses(
     ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
     : '';
   const header = RESPONSES_HEADER.replace('\n====', reflowNote + '\n====');
-  const renderedText = prepareImagedRenderText(header + combined);
+  const renderedText = prepareImagedRenderText(header + combined, o.reflow);
   const profile = resolveGptProfile(req.model);
   const maxCols = o.cols ?? profile.stripCols;
   const cols = Math.min(

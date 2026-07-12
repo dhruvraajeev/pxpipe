@@ -184,6 +184,30 @@ describe('transformOpenAIChatCompletions (gpt-5.6-sol)', () => {
     expect(tools[0]!.function.parameters?.properties?.x?.description).toBeUndefined();
   });
 
+  it('reflows chat static context that contains a literal newline sentinel', async () => {
+    const system = ('first line\nsecond line quotes ↵ literally\nthird line\n').repeat(80);
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6-sol',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: 'hello' },
+      ],
+    }));
+
+    const result = await transformOpenAIChatCompletions(body, {
+      charsPerToken: 1,
+      minCompressChars: 1,
+    });
+
+    expect(result.info.compressed).toBe(true);
+    const source = result.info.imageSourceText!;
+    expect(source).not.toContain('\n');
+    expect(source).toContain('BEGIN RENDERED CONTEXT ======================↵## SYSTEM MESSAGE↵');
+    expect(source).toContain('second line quotes ⏎ literally↵third line');
+    expect(source).not.toMatch(/\s$/);
+    expect(source).not.toMatch(/↵$/);
+  });
+
   it('images GPT tool definitions even when there is no instruction context', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
@@ -323,6 +347,29 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     expect(tools[0]!.description).toBe(BIG_FLAT_TOOL_DESC);
     expect(tools[0]!.parameters?.description).toBeUndefined();
     expect(tools[0]!.parameters?.properties?.x?.description).toBeUndefined();
+  });
+
+  it('reflows Responses static context that contains a literal newline sentinel', async () => {
+    const instructions = ('alpha line\nbeta line quotes ↵ literally\ngamma line\n').repeat(80);
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6-sol',
+      instructions,
+      input: [{ role: 'user', content: 'hello' }],
+    }));
+
+    const result = await transformOpenAIResponses(body, {
+      charsPerToken: 1,
+      minCompressChars: 1,
+    });
+
+    expect(result.info.compressed).toBe(true);
+    const source = result.info.imageSourceText!;
+    expect(source).not.toContain('\n');
+    expect(source).not.toContain('↵IDS↵');
+    expect(source).toContain('BEGIN RENDERED CONTEXT ======================↵## INSTRUCTIONS↵');
+    expect(source).toContain('beta line quotes ⏎ literally↵gamma line');
+    expect(source).not.toMatch(/\s$/);
+    expect(source).not.toMatch(/↵$/);
   });
 
   it('images developer/system items whose content is an input_text part array, not just a string', async () => {
@@ -956,7 +1003,7 @@ describe('resolveGptProfile (Claude on Responses)', () => {
 
 describe('resolveGptProfile (Grok)', () => {
   it('uses pure-image 5x8 packing with shorter white pages under 768px short side', () => {
-    // 2026-07-11 pure-image 5x8: white AA + IDS block is the stable 4/4 recipe
+    // Production uses the pure-image 5x8 white AA profile.
     // (7/7 retest). No grid; paperGray 240 confabulates ports. Width stays 768.
     const p = resolveGptProfile('grok-4.5');
     expect(p.stripCols).toBe(152);

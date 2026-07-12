@@ -4,7 +4,6 @@ import {
   extractFactSheetEntries,
   extractFactSheetEntriesAllPages,
   factSheetText,
-  appendIdsBlock,
 } from '../src/core/factsheet.js';
 
 describe('factsheet extraction', () => {
@@ -171,36 +170,4 @@ describe('ticket-style codes and occurrence counts', () => {
     }
   });
 
-});
-
-describe('appendIdsBlock (pure-image IDS rows for all models)', () => {
-  it('appends an IDS block with hex, camel, path, and port labels', () => {
-    const text = [
-      'Done. The token cache key is a3f9c1e0b7d2. I renamed the field to tokenLedgerShard',
-      'and moved the tier math into src/core/anthropic-vision.ts. Proxy stays on port 47821.',
-    ].join(' ');
-    const out = appendIdsBlock(text);
-    expect(out).toContain('\nIDS\n');
-    expect(out).toContain('hex a3f9c1e0b7d2');
-    expect(out).toContain('camel tokenLedgerShard');
-    expect(out).toContain('path src/core/anthropic-vision.ts');
-    expect(out).toContain('port 47821');
-    // original body preserved
-    expect(out.startsWith(text.trimEnd()) || out.includes('token cache key is a3f9c1e0b7d2')).toBe(true);
-  });
-
-  it('is idempotent — does not double-append', () => {
-    const text = 'key a3f9c1e0b7d2 path src/core/x.ts port 47821';
-    const once = appendIdsBlock(text);
-    expect(appendIdsBlock(once)).toBe(once);
-  });
-
-  it('is deterministic for cache stability', () => {
-    const text = 'hex a3f9c1e0b7d2 camel tokenLedgerShard path src/a/b.ts port 47821';
-    expect(appendIdsBlock(text)).toBe(appendIdsBlock(text));
-  });
-
-  it('returns the original text when nothing notable is present', () => {
-    expect(appendIdsBlock('the quick brown fox')).toBe('the quick brown fox');
-  });
 });

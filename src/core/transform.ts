@@ -35,7 +35,7 @@ import {
   ANTHROPIC_SLAB_COLS,
   renderTextToPngsWithCharLimit,
 } from './render.js';
-import { appendIdsBlock, factSheetText } from './factsheet.js';
+import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
@@ -1358,8 +1358,7 @@ export async function textToImageBlocks(
 }> {
   // Shrink before the numCols branch so gate and renderer see the same canvas width.
   // If shrinkage drops below the full width, stay single-col (avoid wasting a divider column).
-  // IDS block: isolate precision tokens on their own rows (universal pure-image hex aid).
-  const renderText = appendIdsBlock(text);
+  const renderText = text;
   const effectiveCols = shrinkWidth ? shrinkColsToContent(renderText, cols) : cols;
   const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
   const imgs =
@@ -1705,8 +1704,7 @@ export async function transformRequest(
     columnNoteImg +
     reflowNoteImg +
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
-  // IDS block on the imaged slab (same pure-image isolation as Grok/GPT).
-  const combinedWithHeader = appendIdsBlock(imageInstructionHeader + combined);
+  const combinedWithHeader = imageInstructionHeader + combined;
   // Shrink the canvas to the longest actual line in what we'll *render*,
   // so the gate's prediction and the renderer's output agree at the smallest
   // legible width. The banner above sets the natural floor — no separate
