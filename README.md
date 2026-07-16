@@ -240,6 +240,8 @@ pnpm install && pnpm test
 pnpm run build                # regenerates dist/
 ```
 
+Windows is community-supported: primary development targets macOS/Linux, and Windows-specific fixes rely on contributor PRs (thanks @makoribrian).
+
 ## FAQ
 
 **Is the headline end-to-end, or only on the requests you touched?**
