@@ -360,6 +360,65 @@ describe('proxy usage extraction', () => {
     ]);
   });
 
+  it('forwards Messages tool-result images through the Chat Completions upstream', async () => {
+    let upstream: Request | undefined;
+    const restore = mockUpstream((req) => {
+      upstream = req.clone();
+      return new Response(JSON.stringify({
+        id: 'chatcmpl_vision', model: 'moonshotai/kimi-k3',
+        choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'PXPIPE-NONCE' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 2 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      chatUpstream: 'https://api.cloudflare.test/ai/v1',
+      chatApiKey: 'cf-test',
+      chatModel: 'moonshotai/kimi-k3',
+      transform: { compress: false },
+    });
+    const response = await proxy(new Request('http://localhost/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer anthropic-secret' },
+      body: JSON.stringify({
+        model: 'claude-moonshotai/kimi-k3', max_tokens: 128,
+        messages: [
+          { role: 'assistant', content: [
+            { type: 'tool_use', id: 'toolu_image', name: 'read', input: { path: 'nonce.png' } },
+          ] },
+          { role: 'user', content: [
+            { type: 'tool_result', tool_use_id: 'toolu_image', content: [
+              { type: 'text', text: 'Image read successfully.' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } },
+            ] },
+            { type: 'text', text: 'Return the visible nonce.' },
+          ] },
+        ],
+      }),
+    }));
+    const converted = await response.json() as any;
+    restore();
+
+    expect(upstream?.url).toBe('https://api.cloudflare.test/ai/v1/chat/completions');
+    expect(upstream?.headers.get('authorization')).toBe('Bearer cf-test');
+    const sent = JSON.parse(await upstream!.text());
+    expect(sent.model).toBe('moonshotai/kimi-k3');
+    expect(sent.messages).toEqual([
+      {
+        role: 'assistant', content: null,
+        tool_calls: [{
+          id: 'toolu_image', type: 'function',
+          function: { name: 'read', arguments: '{"path":"nonce.png"}' },
+        }],
+      },
+      { role: 'tool', tool_call_id: 'toolu_image', content: 'Image read successfully.' },
+      { role: 'user', content: [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,YWJj' } },
+        { type: 'text', text: 'Return the visible nonce.' },
+      ] },
+    ]);
+    expect(converted.content).toEqual([{ type: 'text', text: 'PXPIPE-NONCE' }]);
+  });
+
   it('rejects Messages blocks that the Responses bridge cannot preserve', async () => {
     let called = false;
     const restore = mockUpstream(() => {
@@ -402,6 +461,226 @@ describe('proxy usage extraction', () => {
     restore();
     expect(requests.some((request) => request.url === 'https://anthropic.test/v1/messages')).toBe(true);
     expect(requests.some((request) => request.url.includes('/v1/responses'))).toBe(false);
+  });
+
+  it('routes a scope-listed Kimi model to chatUpstream, not the Responses bridge', async () => {
+    // Scope alone must not classify a model as GPT: kimi is listed here, yet
+    // it has to take the Chat Completions bridge because its NAME is not
+    // GPT/Grok-shaped. Regression for the shared-PXPIPE_MODELS routing hole.
+    const prior = process.env.PXPIPE_MODELS;
+    process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,moonshotai/kimi-k3';
+    let upstream: Request | undefined;
+    const restore = mockUpstream((req) => {
+      upstream = req.clone();
+      return new Response(JSON.stringify({
+        id: 'chatcmpl_1', model: 'moonshotai/kimi-k3',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3, completion_tokens: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      openAIUpstream: 'https://openai.test',
+      chatUpstream: 'https://kimi.test/v1', chatApiKey: 'tok_kimi',
+      transform: { compress: false },
+    });
+    const res = await proxy(new Request('http://localhost/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'moonshotai/kimi-k3', max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }));
+    const body = await res.json() as any;
+    restore();
+    if (prior === undefined) delete process.env.PXPIPE_MODELS;
+    else process.env.PXPIPE_MODELS = prior;
+    expect(upstream?.url).toBe('https://kimi.test/v1/chat/completions');
+    expect(upstream?.headers.get('authorization')).toBe('Bearer tok_kimi');
+    const sent = JSON.parse(await upstream!.text());
+    expect(sent.model).toBe('moonshotai/kimi-k3');
+    expect(Array.isArray(sent.messages)).toBe(true);
+    expect(sent.input).toBeUndefined(); // Responses-bridge shape must not leak in.
+    expect(body).toMatchObject({ type: 'message', role: 'assistant' });
+  });
+
+  it('advertises a reversible Claude-safe id for gateway model discovery', async () => {
+    const proxy = createProxy({
+      chatUpstream: 'https://kimi.test/v1',
+      resolveChatModel: async () => 'moonshotai/kimi-k3',
+    });
+    const res = await proxy(new Request('http://localhost/v1/models?limit=1000'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      data: [{
+        id: 'claude-moonshotai/kimi-k3',
+        type: 'model',
+        display_name: 'Kimi K3 (Cloudflare)',
+        created_at: '1970-01-01T00:00:00Z',
+      }],
+      has_more: false,
+      first_id: 'claude-moonshotai/kimi-k3',
+      last_id: 'claude-moonshotai/kimi-k3',
+    });
+  });
+
+  it('returns an empty discovery list when a generic chat upstream has no configured model', async () => {
+    const proxy = createProxy({ chatUpstream: 'https://chat.test/v1' });
+    expect(await (await proxy(new Request('http://localhost/v1/models'))).json()).toEqual({
+      data: [], has_more: false, first_id: '', last_id: '',
+    });
+  });
+
+  it('uses the resolved Kimi model for compression eligibility and telemetry', async () => {
+    const prior = process.env.PXPIPE_MODELS;
+    process.env.PXPIPE_MODELS = 'moonshotai/kimi-k3';
+    let sent: any;
+    let captured: ProxyEvent | undefined;
+    const restore = mockUpstream(async (req) => {
+      sent = JSON.parse(await req.text());
+      return new Response(JSON.stringify({
+        id: 'chatcmpl_3', model: 'moonshotai/kimi-k3',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3, completion_tokens: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      chatUpstream: 'https://kimi.test/v1',
+      resolveChatModel: async () => 'moonshotai/kimi-k3',
+      transform: { compress: true, minCompressChars: 1 },
+      onRequest: (event) => { captured = event; },
+    });
+    const res = await proxy(new Request('http://localhost/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-moonshotai/kimi-k3', max_tokens: 64,
+        system: 'Long system context. '.repeat(200),
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+    if (prior === undefined) delete process.env.PXPIPE_MODELS;
+    else process.env.PXPIPE_MODELS = prior;
+    expect(sent.model).toBe('moonshotai/kimi-k3');
+    expect(captured?.model).toBe('moonshotai/kimi-k3');
+    expect(captured?.info?.reason).not.toBe('unsupported_model');
+  });
+
+  it('decodes the selected gateway id without consulting model discovery', async () => {
+    let sentModel = '';
+    const restore = mockUpstream(async (req) => {
+      sentModel = JSON.parse(await req.text()).model;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      chatUpstream: 'https://chat.test/v1',
+      resolveChatModel: async () => { throw new Error('must not run'); },
+      transform: { compress: false },
+    });
+    await (await proxy(new Request('http://localhost/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-moonshotai/kimi-k3',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }))).text();
+    restore();
+    expect(sentModel).toBe('moonshotai/kimi-k3');
+  });
+
+  it('routes ALL Messages traffic to chatUpstream once it is configured', async () => {
+    // OPENAPI_URL (or the Cloudflare-derived URL) declares "this is my
+    // endpoint": routing stops being name-based, so GPT-named and even
+    // claude-named requests bridge to chatUpstream instead of the Responses
+    // bridge / Anthropic passthrough. Model ids forward verbatim because no
+    // chatModel (OPENAPI_MODEL) override is set.
+    const seen: Request[] = [];
+    const restore = mockUpstream((req) => {
+      seen.push(req.clone());
+      return new Response(JSON.stringify({
+        id: 'chatcmpl_2', model: 'whatever',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3, completion_tokens: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      openAIUpstream: 'https://openai.test',
+      chatUpstream: 'https://kimi.test/v1', chatApiKey: 'tok_kimi',
+      transform: { compress: false },
+    });
+    for (const model of ['gpt-5.6-sol', 'claude-fable-5']) {
+      await (await proxy(new Request('http://localhost/v1/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] }),
+      }))).text();
+    }
+    restore();
+    expect(seen).toHaveLength(2);
+    for (const req of seen) expect(req.url).toBe('https://kimi.test/v1/chat/completions');
+    const sentModels = await Promise.all(seen.map(async (req) => JSON.parse(await req.text()).model));
+    expect(sentModels).toEqual(['gpt-5.6-sol', 'claude-fable-5']);
+  });
+
+  it('routes Messages requests by explicit provider model scopes', async () => {
+    const seen: Request[] = [];
+    const restore = mockUpstream(async (req) => {
+      seen.push(req.clone());
+      if (req.url.includes('/chat/completions')) {
+        return new Response(JSON.stringify({
+          id: 'chatcmpl_scoped', model: 'moonshotai/kimi-k3',
+          choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }), { headers: { 'content-type': 'application/json' } });
+      }
+      if (req.url.includes('/responses')) {
+        return new Response(JSON.stringify({
+          id: 'resp_scoped', status: 'completed', model: 'custom-codex', output: [],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }), { headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        id: 'msg_scoped', type: 'message', role: 'assistant', model: 'custom-claude',
+        content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 1, output_tokens: 1 },
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      upstream: 'https://anthropic.test',
+      openAIUpstream: 'https://openai.test',
+      chatUpstream: 'https://cloudflare.test/ai/v1',
+      chatModel: 'legacy-global-override',
+      anthropicModels: ['custom-claude'],
+      openAIModels: ['custom-codex'],
+      cloudflareModels: ['moonshotai/kimi-k3'],
+      transform: { compress: false },
+    });
+    for (const model of ['custom-claude', 'custom-codex', 'moonshotai/kimi-k3']) {
+      await (await proxy(new Request('http://localhost/v1/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+      }))).text();
+    }
+    restore();
+    expect(seen.some((req) => req.url === 'https://anthropic.test/v1/messages')).toBe(true);
+    expect(seen.some((req) => req.url === 'https://openai.test/v1/responses')).toBe(true);
+    const cloudflareRequest = seen.find((req) => req.url.includes('/chat/completions'))!;
+    expect(cloudflareRequest.url).toBe('https://cloudflare.test/ai/v1/chat/completions');
+    expect(JSON.parse(await cloudflareRequest.text()).model).toBe('moonshotai/kimi-k3');
+  });
+
+  it('rejects overlapping provider model scopes', () => {
+    expect(() => createProxy({
+      anthropicModels: ['shared-model'],
+      openAIModels: ['shared-model'],
+    })).toThrow('model shared-model is configured for both anthropic and openai');
+  });
+
+  it('requires a chat upstream when Cloudflare models are scoped', () => {
+    expect(() => createProxy({ cloudflareModels: ['moonshotai/kimi-k3'] }))
+      .toThrow('cloudflareModels requires a Cloudflare or OPENAPI chat upstream');
   });
 
   it('correlates interleaved parallel tool deltas and recovers sparse terminal calls', async () => {

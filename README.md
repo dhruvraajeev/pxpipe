@@ -66,6 +66,24 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
+Route different models through different providers while keeping one client
+base URL:
+
+```bash
+ANTHROPIC_MODELS=claude-fable-5 \
+OPENAI_MODELS=gpt-5.6-sol \
+CLOUDFLARE_MODELS=moonshotai/kimi-k3 \
+CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... \
+npx pxpipe-proxy
+```
+
+The lists contain comma-separated exact model IDs. Listed models route to the
+corresponding Anthropic Messages, OpenAI Responses, or Cloudflare-compatible
+Chat Completions upstream; overlapping entries fail at startup. Unlisted
+models retain pxpipe's normal family routing, so Claude, OpenCode, and Codex
+can share the proxy. `OPENAPI_URL` and `OPENAPI_API` may replace the derived
+Cloudflare endpoint and token.
+
 ## Offline export (no proxy)
 
 You can render text, files, or diffs to PNG pages without running the proxy or
@@ -143,33 +161,38 @@ Every model row below uses the model's production profile unless a pure-image
 research arm is called out. Sol uses **5×8 Spleen + adjacent text factsheet**;
 the rejected RGB-overprint research remains documented under `eval/sol-profile`.
 Claude numbers are novel problems the model cannot have memorized. Sol and Grok
-quality use Codex’s Responses provider; Fable/Opus use Claude. Token deltas
+quality use Codex’s Responses provider; Kimi K3 uses Cloudflare's
+OpenAI-compatible transport through pxpipe; Fable/Opus use Claude. Token deltas
 compare matched input arms: negative saves tokens; positive costs more. The
 historical GSM8K run measured −38%, but it is a different corpus and is not
 used for these novel-arithmetic rows.
 
-| test | model | N | text | pxpipe (image) | tokens |
-|---|---|---:|---:|---:|---|
-| novel arithmetic | `claude-fable-5` | 100 | 100% | **100%** | not measured |
-| novel arithmetic | `gpt-5.6-sol` | 100 | 100% | **98%** | **+32%** |
-| novel arithmetic | `claude-opus-4-8` | 100 | 100% | 93% | not measured |
-| novel arithmetic | `grok-4.5` | 100 | 100% | **82%** | **+7%** |
-| gist recall A/B (decisions, values, paths, names, negations; distractors; 15k–45k char sessions) | Fable 5 | 98/arm | 98/98 | **98/98** | not measured |
-| same gist corpus, production images + factsheet | `gpt-5.6-sol` | 98 | not measured | **79/93 completed; 1 session error** | not measured |
-| same gist corpus, production images + factsheet | `grok-4.5` | 98 | 98/98 | **83/98** | not measured |
-| state tracking (value mutated 3×, final/first/count) | Fable 5 | 18/arm | 18/18 | **18/18** | not measured |
-| same state-tracking corpus | `gpt-5.6-sol` | 18 | not measured | **18/18 latest** | not measured |
-| same state-tracking corpus | `grok-4.5` | 18 | 18/18 | **13/18** | not measured |
-| confabulation on never-stated facts (lower is better) | Fable 5 | 16/arm | 0/16 | **0/16** | not measured |
-| same never-stated probes (lower is better) | `gpt-5.6-sol` | 16 | not measured | **4/15 completed; 1 session error** | not measured |
-| same never-stated probes (lower is better) | `grok-4.5` | 16 | 0/16 | **0/16** | not measured |
-| verbatim 12-char hex, dense render | Opus | 15 | 15/15 | **0/15** | not measured |
-| verbatim 12-char hex, dense render | Fable 5 | 15 | not measured | **13/15** | not measured |
-| verbatim 12-char hex, same dense pages | `gpt-5.6-sol` | 15 | not measured | **0/15** | not measured |
-| verbatim 12-char hex, same dense pages | `grok-4.5` | 15 | 15/15 | **0/6 completed; 9 transport errors** | not measured |
+| test | model | N | pxpipe (image) |
+| --- | --- | ---: | ---: |
+| novel arithmetic | `claude-fable-5` | 100 | **100%** |
+| novel arithmetic | `gpt-5.6-sol` | 100 | **98%** |
+| novel arithmetic | `claude-opus-4-8` | 100 | 93% |
+| novel arithmetic | `grok-4.5` | 100 | **82%** |
+| novel arithmetic | `moonshotai/kimi-k3` | 100 | **79%** |
+| gist recall A/B (decisions, values, paths, names, negations; distractors; 15k–45k char sessions) | Fable 5 | 98/arm | **98/98** |
+| same gist corpus, production images + factsheet | `gpt-5.6-sol` | 98 | **79/93 completed; 1 session error** |
+| same gist corpus, production images + factsheet | `grok-4.5` | 98 | **83/98** |
+| state tracking (value mutated 3×, final/first/count) | Fable 5 | 18/arm | **18/18** |
+| same state-tracking corpus | `gpt-5.6-sol` | 18 | **18/18 latest** |
+| same state-tracking corpus | `grok-4.5` | 18 | **13/18** |
+| confabulation on never-stated facts (lower is better) | Fable 5 | 16/arm | **0/16** |
+| same never-stated probes (lower is better) | `gpt-5.6-sol` | 16 | **4/15 completed; 1 session error** |
+| same never-stated probes (lower is better) | `grok-4.5` | 16 | **0/16** |
+| verbatim 12-char hex, dense render | Opus | 15 | **0/15** |
+| verbatim 12-char hex, dense render | Fable 5 | 15 | **13/15** |
+| verbatim 12-char hex, same dense pages | `gpt-5.6-sol` | 15 | **0/15** |
+| verbatim 12-char hex, same dense pages | `grok-4.5` | 15 | **0/6 completed; 9 transport errors** |
 
 **Harness split:** Fable/Opus quality and SWE-bench rows use **Claude**; Sol and Grok quality use
-**Codex’s Responses provider** (`OPENAI_BASE_URL`) — see
+**Codex’s Responses provider** (`OPENAI_BASE_URL`). Kimi K3
+used the same novel-arithmetic corpus and production renderer through pxpipe's
+Cloudflare Messages bridge — see the
+[`K3 receipt`](eval/sol-profile/model-moonshotai_kimi-k3-novel-arithmetic-results.json) and
 [`eval/grok-density/QUALITY_SUITE.md`](eval/grok-density/QUALITY_SUITE.md).
 
 Sol receipts: [`eval/sol-profile/QUALITY_RESULTS.md`](eval/sol-profile/QUALITY_RESULTS.md).

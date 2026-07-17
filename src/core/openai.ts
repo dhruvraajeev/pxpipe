@@ -123,6 +123,17 @@ export function isGrokModel(model: string | null | undefined): boolean {
   return (model ?? '').toLowerCase().startsWith('grok-');
 }
 
+/** Name-shaped test for models that speak the OpenAI *Responses* API
+ *  (GPT/o-series/codex, plus Grok's OpenAI-compatible surface). Routing must
+ *  be name-based here: PXPIPE_MODELS is one scope shared by every family, so
+ *  "allowed" alone cannot tell a GPT entry from a Kimi one. Anything not
+ *  name-matched (Kimi, DeepSeek, …) falls through to the Chat Completions
+ *  bridge / passthrough instead of being forced onto the Responses bridge. */
+export function isGptResponsesModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('gpt-') || m.startsWith('codex') || /^o\d/.test(m) || isGrokModel(m);
+}
+
 /** Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel
  *  across several page sizes (768x336 → 268, 764x980 → 748, etc.). */
 export const GROK_TOKENS_PER_MEGAPIXEL = 1000;
@@ -395,27 +406,60 @@ function isFlatFunctionTool(tool: unknown): tool is ResponsesFlatTool {
   );
 }
 
-/** Full doc (prose + compact schema JSON) for one tool. On this path the docs are
- *  IMAGED, so carrying the schema here is compression, not duplication: the imaged
- *  copy keeps param docs readable while tools[] ships the stripped skeleton.
- *  (Contrast transform.ts renderToolDoc: text reference → prose only.) */
+/** Render only schema annotations removed from the native tool definition.
+ * Structural JSON and the top-level tool description remain native, so putting
+ * them in the image too spends vision tokens without replacing any text. */
+function schemaAnnotationLines(node: unknown, path = '$', depth = 0): string[] {
+  if (!node || typeof node !== 'object' || depth > 20) return [];
+  if (Array.isArray(node)) {
+    return node.flatMap((value, i) => schemaAnnotationLines(value, `${path}[${i}]`, depth + 1));
+  }
+  const obj = node as Record<string, unknown>;
+  const out: string[] = [];
+  for (const key of ['description', 'title', 'examples', 'default', '$comment']) {
+    if (obj[key] !== undefined) out.push(`${path} ${key}: ${JSON.stringify(obj[key])}`);
+  }
+  if (typeof obj.format === 'string' && obj.format.length > 32) {
+    out.push(`${path} format: ${JSON.stringify(obj.format)}`);
+  }
+  for (const key of ['properties', 'patternProperties', 'definitions', '$defs']) {
+    const children = obj[key];
+    if (!children || typeof children !== 'object' || Array.isArray(children)) continue;
+    for (const [name, child] of Object.entries(children as Record<string, unknown>)) {
+      out.push(...schemaAnnotationLines(child, `${path}.${name}`, depth + 1));
+    }
+  }
+  for (const key of ['oneOf', 'anyOf', 'allOf']) {
+    const children = obj[key];
+    if (!Array.isArray(children)) continue;
+    children.forEach((child, i) => {
+      out.push(...schemaAnnotationLines(child, `${path}.${key}[${i}]`, depth + 1));
+    });
+  }
+  for (const key of [
+    'items', 'additionalProperties', 'not', 'contains', 'propertyNames',
+    'unevaluatedItems', 'unevaluatedProperties', 'if', 'then', 'else',
+  ]) {
+    if (obj[key] !== undefined) {
+      out.push(...schemaAnnotationLines(obj[key], `${path}.${key}`, depth + 1));
+    }
+  }
+  return out;
+}
+
 function renderToolDoc(tool: OpenAIFunctionTool): string {
   const f = tool.function;
-  const parts = [`## Tool: ${f.name ?? '?'}`];
-  if (typeof f.description === 'string' && f.description.length > 0) parts.push(f.description);
-  if (f.parameters !== undefined) {
-    parts.push('```json\n' + JSON.stringify(f.parameters) + '\n```');
-  }
-  return parts.join('\n');
+  const annotations = schemaAnnotationLines(f.parameters);
+  return annotations.length
+    ? [`## Tool parameter annotations: ${f.name ?? '?'}`, ...annotations].join('\n')
+    : '';
 }
 
 function renderFlatToolDoc(tool: ResponsesFlatTool): string {
-  const parts = [`## Tool: ${tool.name ?? '?'}`];
-  if (typeof tool.description === 'string' && tool.description.length > 0) parts.push(tool.description);
-  if (tool.parameters !== undefined) {
-    parts.push('```json\n' + JSON.stringify(tool.parameters) + '\n```');
-  }
-  return parts.join('\n');
+  const annotations = schemaAnnotationLines(tool.parameters);
+  return annotations.length
+    ? [`## Tool parameter annotations: ${tool.name ?? '?'}`, ...annotations].join('\n')
+    : '';
 }
 
 function rewriteToolsForGpt(tools: unknown[] | undefined): {
@@ -427,7 +471,8 @@ function rewriteToolsForGpt(tools: unknown[] | undefined): {
   let changed = false;
   const rewritten = tools.map((tool) => {
     if (!isFunctionTool(tool)) return tool;
-    docs.push(renderToolDoc(tool));
+    const doc = renderToolDoc(tool);
+    if (doc) docs.push(doc);
     if (tool.function.parameters === undefined) return tool;
     changed = true;
     return {
@@ -450,7 +495,8 @@ function rewriteFlatToolsForGpt(tools: unknown[] | undefined): {
   let changed = false;
   const rewritten = tools.map((tool) => {
     if (!isFlatFunctionTool(tool)) return tool;
-    docs.push(renderFlatToolDoc(tool));
+    const doc = renderFlatToolDoc(tool);
+    if (doc) docs.push(doc);
     if (tool.parameters === undefined) return tool;
     changed = true;
     return {

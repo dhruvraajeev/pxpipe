@@ -107,8 +107,16 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
   if (Array.isArray(req.messages)) {
     for (const rawMessage of req.messages) {
       const message = object(rawMessage);
-      if (!message || (message.role !== 'user' && message.role !== 'assistant')) {
-        invalidRequest('Each message must have a user or assistant role');
+      if (!message
+        || (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'system')) {
+        invalidRequest('Each message must have a user, assistant, or system role');
+      }
+      // Newer Claude Code builds inject system-role messages mid-conversation
+      // (e.g. system reminders); map them to Responses system input items.
+      if (message.role === 'system') {
+        const text = textFromBlocks(message.content);
+        if (text) input.push({ role: 'system', content: [{ type: 'input_text', text }] });
+        continue;
       }
       const content = message.content;
       if (!Array.isArray(content)) {

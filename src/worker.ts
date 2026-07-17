@@ -24,6 +24,12 @@ export interface Env {
   OPENAI_UPSTREAM?: string;
   /** Optional override — if set, replaces whatever Authorization the client sent. */
   OPENAI_API_KEY?: string;
+  ANTHROPIC_MODELS?: string;
+  OPENAI_MODELS?: string;
+  CLOUDFLARE_MODELS?: string;
+  /** OpenAI-compatible chat-completions endpoint for non-Claude models (Kimi etc.). */
+  OPENAPI_URL?: string;
+  OPENAPI_API?: string;
   COMPRESS?: string;
   COMPRESS_TOOLS?: string;
   COMPRESS_REMINDERS?: string;
@@ -122,11 +128,18 @@ export default {
     const tracker: Tracker = trackingOn ? new JsonLogTracker((s) => console.log(s)) : noopTracker;
 
     const sharedUpstream = env.PXPIPE_UPSTREAM;
+    const parseModels = (value: string | undefined): string[] | undefined =>
+      value === undefined ? undefined : value.split(',').map((model) => model.trim()).filter(Boolean);
     const config: ProxyConfig = {
       upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
       apiKey: env.ANTHROPIC_API_KEY,
       openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
       openAIApiKey: env.OPENAI_API_KEY,
+      chatUpstream: env.OPENAPI_URL?.trim() || undefined,
+      chatApiKey: env.OPENAPI_API?.trim() || undefined,
+      anthropicModels: parseModels(env.ANTHROPIC_MODELS),
+      openAIModels: parseModels(env.OPENAI_MODELS),
+      cloudflareModels: parseModels(env.CLOUDFLARE_MODELS),
       transform,
       onRequest: (e) => {
         // Terse human-readable line (separate from the JSON event below;

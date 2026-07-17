@@ -14,6 +14,12 @@ import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import {
+  chatCompletionsUrl,
+  DEFAULT_CHAT_MODEL,
+  makeCloudflareModelResolver,
+  resolveChatUpstream,
+} from './core/messages-chat-bridge.js';
+import {
   parseExportArgv,
   runExportCore,
   type ExportParsed,
@@ -45,6 +51,20 @@ interface RuntimeConfig {
   upstream: string;
   openAIUpstream: string;
   openAIApiKey?: string;
+  /** Any OpenAI-compatible chat-completions endpoint (e.g. Kimi via Cloudflare
+   *  Workers AI). When defined, ALL /v1/messages traffic bridges to it —
+   *  routing stops being name-based. Undefined disables the bridge. */
+  chatUpstream?: string;
+  chatApiKey?: string;
+  /** OPENAPI_MODEL: optional model id stamped onto each bridged request (e.g.
+   *  a specific Kimi model); without it the client-sent id forwards verbatim. */
+  chatModel?: string;
+  /** Zero-config model pick: Cloudflare creds without OPENAPI_MODEL → lazily
+   *  ask the account catalog which Kimi model exists and stamp that. */
+  resolveChatModel?: () => Promise<string | undefined>;
+  anthropicModels?: string[];
+  openAIModels?: string[];
+  cloudflareModels?: string[];
   provider?: 'cloudflare-ai-gateway';
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
@@ -107,6 +127,42 @@ function parseCli(argv: string[]): RuntimeConfig {
   }
   applyConfigFileDefaults();
   const sharedUpstream = process.env.PXPIPE_UPSTREAM;
+  // Zero-config Cloudflare Workers AI: given just an account id + API token,
+  // synthesize the OpenAI-compatible chat endpoint and bearer key so the user
+  // needn't spell out OPENAPI_URL/OPENAPI_API. Explicit OPENAPI_URL still wins.
+  const chat = resolveChatUpstream({
+    openapiUrl: process.env.OPENAPI_URL,
+    openapiApi: process.env.OPENAPI_API,
+    cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
+    cloudflareApiToken: process.env.CLOUDFLARE_API_TOKEN,
+  });
+  // Zero-config model pick: Cloudflare creds without OPENAPI_MODEL/OPENAPI_URL
+  // → discover the account's Kimi model from its catalog on first use, instead
+  // of making the operator hardcode a model id that may not exist there.
+  const cfAccount = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  const cfToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  const openapiModel = process.env.OPENAPI_MODEL?.trim() || undefined;
+  const parseModels = (value: string | undefined): string[] | undefined => {
+    if (value === undefined) return undefined;
+    return value.split(',').map((model) => model.trim()).filter(Boolean);
+  };
+  const resolveChatModel =
+    openapiModel === undefined && !process.env.OPENAPI_URL?.trim() && cfAccount && cfToken
+      ? makeCloudflareModelResolver({
+          accountId: cfAccount,
+          apiToken: cfToken,
+          log: (m) => console.error(`[pxpipe] ${m}`),
+        })
+      : undefined;
+  const configuredCloudflareModels = parseModels(process.env.CLOUDFLARE_MODELS);
+  // Cloudflare credentials are additive provider configuration, not a request
+  // to replace Claude/OpenAI globally. Scope their derived chat upstream to
+  // the configured model, or to the model exposed by Cloudflare discovery.
+  // An explicit OPENAPI_URL retains its historical global-override behavior.
+  const cloudflareModels = configuredCloudflareModels
+    ?? (!process.env.OPENAPI_URL?.trim() && cfAccount && cfToken
+      ? [openapiModel ?? DEFAULT_CHAT_MODEL]
+      : undefined);
   return {
     port: Number(process.env.PORT ?? 47821),
     // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
@@ -114,6 +170,16 @@ function parseCli(argv: string[]): RuntimeConfig {
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
+    // Any OpenAI-compatible chat endpoint (e.g. Kimi via Cloudflare Workers AI).
+    chatUpstream: chat.chatUpstream,
+    // Pair the Cloudflare token only with the derived Cloudflare endpoint.
+    chatApiKey: chat.chatApiKey,
+    // Optional per-model override forwarded to the chat upstream (e.g. Kimi model id).
+    chatModel: openapiModel,
+    resolveChatModel,
+    anthropicModels: parseModels(process.env.ANTHROPIC_MODELS),
+    openAIModels: parseModels(process.env.OPENAI_MODELS),
+    cloudflareModels,
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
@@ -162,6 +228,24 @@ Environment:
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
                            (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
+  ANTHROPIC_MODELS        comma-separated exact model ids routed to Anthropic
+  OPENAI_MODELS           comma-separated exact model ids routed to OpenAI
+  CLOUDFLARE_MODELS       comma-separated exact model ids routed to Cloudflare
+                          Chat Completions. Scoped lists override normal model
+                          inference only for listed models; overlaps are errors.
+  OPENAPI_URL             OpenAI-compatible chat-completions endpoint (e.g.
+                          Kimi via Cloudflare Workers AI, Moonshot, OpenRouter).
+                          When set, ALL /v1/messages traffic bridges to it,
+                          whatever model id the client sends (claude-*, gpt-*,
+                          kimi-*, ...).
+  OPENAPI_API             bearer key for OPENAPI_URL
+  OPENAPI_MODEL           optional: stamp this model id on every bridged request
+                          (e.g. @cf/moonshotai/kimi-k2-instruct) instead of
+                          forwarding the client-sent id verbatim. Use this when
+                          Claude Code keeps sending claude-* ids you want mapped.
+  CLOUDFLARE_ACCOUNT_ID   with CLOUDFLARE_API_TOKEN, zero-config Cloudflare
+  CLOUDFLARE_API_TOKEN    Workers AI: derives the OPENAPI_URL/key for you
+                          (https://api.cloudflare.com/.../ai/v1). OPENAPI_URL wins.
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
@@ -968,6 +1052,17 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
+    // Chat-completions bridge upstream (OPENAPI_URL or Cloudflare-derived).
+    // These were computed in loadConfig but previously never handed to the
+    // proxy engine — which silently disabled the bridge in the real server
+    // while unit tests (which build ProxyConfig directly) kept passing.
+    chatUpstream: opts.chatUpstream,
+    chatApiKey: opts.chatApiKey,
+    chatModel: opts.chatModel,
+    resolveChatModel: opts.resolveChatModel,
+    anthropicModels: opts.anthropicModels,
+    openAIModels: opts.openAIModels,
+    cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
@@ -1107,6 +1202,15 @@ async function main(): Promise<void> {
     const routes = resolveUpstreams(config);
     console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);
+    if (opts.chatUpstream !== undefined) {
+      const scope = opts.cloudflareModels?.length
+        ? `models: ${opts.cloudflareModels.join(', ')}`
+        : `model: ${opts.chatModel ?? (opts.resolveChatModel !== undefined ? 'auto-discover' : 'client-sent')}`;
+      console.log(
+        `[pxpipe] chat upstream → ${chatCompletionsUrl(opts.chatUpstream)} ` +
+          `(${scope})`,
+      );
+    }
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
     if (opts.captureErrorReqBody) {
