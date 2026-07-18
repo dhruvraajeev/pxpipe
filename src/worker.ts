@@ -24,12 +24,10 @@ export interface Env {
   OPENAI_UPSTREAM?: string;
   /** Optional override — if set, replaces whatever Authorization the client sent. */
   OPENAI_API_KEY?: string;
-  ANTHROPIC_MODELS?: string;
   OPENAI_MODELS?: string;
   CLOUDFLARE_MODELS?: string;
-  /** OpenAI-compatible chat-completions endpoint for non-Claude models (Kimi etc.). */
-  OPENAPI_URL?: string;
-  OPENAPI_API?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CLOUDFLARE_API_TOKEN?: string;
   COMPRESS?: string;
   COMPRESS_TOOLS?: string;
   COMPRESS_REMINDERS?: string;
@@ -77,7 +75,7 @@ export default {
     // If this deployment injects API keys, never serve anonymous callers:
     // workers.dev URLs are discoverable, and without this gate anyone who
     // finds the URL spends this deployment's API credits.
-    if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY) {
+    if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.CLOUDFLARE_API_TOKEN) {
       if (!env.PXPIPE_WORKER_SECRET) {
         return new Response(
           JSON.stringify({
@@ -130,14 +128,18 @@ export default {
     const sharedUpstream = env.PXPIPE_UPSTREAM;
     const parseModels = (value: string | undefined): string[] | undefined =>
       value === undefined ? undefined : value.split(',').map((model) => model.trim()).filter(Boolean);
+    const cfAccount = env.CLOUDFLARE_ACCOUNT_ID?.trim();
+    const cfToken = env.CLOUDFLARE_API_TOKEN?.trim();
+    const cloudflareUpstream = cfAccount && cfToken
+      ? `https://api.cloudflare.com/client/v4/accounts/${cfAccount}/ai/v1`
+      : undefined;
     const config: ProxyConfig = {
       upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
       apiKey: env.ANTHROPIC_API_KEY,
       openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
       openAIApiKey: env.OPENAI_API_KEY,
-      chatUpstream: env.OPENAPI_URL?.trim() || undefined,
-      chatApiKey: env.OPENAPI_API?.trim() || undefined,
-      anthropicModels: parseModels(env.ANTHROPIC_MODELS),
+      cloudflareUpstream,
+      cloudflareApiKey: cfToken,
       openAIModels: parseModels(env.OPENAI_MODELS),
       cloudflareModels: parseModels(env.CLOUDFLARE_MODELS),
       transform,

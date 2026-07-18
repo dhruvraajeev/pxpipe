@@ -4,7 +4,7 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { isClaudeModel, isGptResponsesModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
+import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
@@ -37,26 +37,11 @@ export interface ProxyConfig {
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
-  /** OpenAI-compatible chat-completions endpoint for non-Claude, non-GPT models
-   *  (e.g. Kimi via Cloudflare Workers AI / Moonshot / OpenRouter). When set,
-   *  a /v1/messages request for such a model is bridged to Chat Completions and
-   *  forwarded here. Base URL, `/v1` base, or full …/chat/completions all work. */
-  chatUpstream?: string;
-  /** Bearer key for chatUpstream. */
-  chatApiKey?: string;
-  /** OPENAPI_MODEL: force ALL /v1/messages traffic to chatUpstream and stamp this
-   *  model id upstream, regardless of the model name the client sends. Lets Claude
-   *  Code keep its own model label while every request goes to Kimi/etc. When
-   *  unset, routing stays name-based (Claude names pass through to Anthropic). */
-  chatModel?: string;
-  /** Lazy model discovery for chatUpstream: consulted only for bridged
-   *  requests whose client-sent model is a Claude name and no chatModel is
-   *  set (a claude-* id forwarded verbatim to a non-Anthropic upstream can
-   *  never succeed). The resolver caches its own result. */
-  resolveChatModel?: () => Promise<string | undefined>;
-  /** Exact model ids routed to each provider from the Messages compatibility
-   * endpoint. Unlisted models retain the normal name-based routing behavior. */
-  anthropicModels?: string[];
+  /** Cloudflare's OpenAI-compatible Chat Completions endpoint and bearer key. */
+  cloudflareUpstream?: string;
+  cloudflareApiKey?: string;
+  /** Exact model ids routed to each non-default provider. Unlisted Claude
+   * models retain normal Anthropic routing. */
   openAIModels?: string[];
   cloudflareModels?: string[];
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
@@ -138,7 +123,7 @@ function resolveClaudeGatewayModelId(model: string | null): string | undefined {
   return providerModel.includes('/') ? providerModel : undefined;
 }
 
-function chatModelDisplayName(model: string): string {
+function cloudflareModelDisplayName(model: string): string {
   return /kimi-k3/i.test(model) ? 'Kimi K3 (Cloudflare)' : model;
 }
 
@@ -654,26 +639,19 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
 
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
-  const modelRoutes = new Map<string, 'anthropic' | 'openai' | 'cloudflare'>();
-  for (const [provider, models] of [
-    ['anthropic', config.anthropicModels],
-    ['openai', config.openAIModels],
-    ['cloudflare', config.cloudflareModels],
-  ] as const) {
-    for (const model of models ?? []) {
-      const id = model.trim();
-      if (!id) continue;
-      const existing = modelRoutes.get(id);
-      if (existing && existing !== provider) {
-        throw new Error(`model ${id} is configured for both ${existing} and ${provider}`);
-      }
-      modelRoutes.set(id, provider);
-    }
+  const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
+  // Explicit precedence: Cloudflare > OpenAI > normal family routing.
+  for (const model of config.openAIModels ?? []) {
+    const id = model.trim();
+    if (id) modelRoutes.set(id, 'openai');
   }
-  if ((config.cloudflareModels?.length ?? 0) > 0 && config.chatUpstream === undefined) {
-    throw new Error('cloudflareModels requires a Cloudflare or OPENAPI chat upstream');
+  for (const model of config.cloudflareModels ?? []) {
+    const id = model.trim();
+    if (id) modelRoutes.set(id, 'cloudflare');
   }
-  const scopedRouting = modelRoutes.size > 0;
+  if ((config.cloudflareModels?.length ?? 0) > 0 && config.cloudflareUpstream === undefined) {
+    throw new Error('cloudflareModels requires a Cloudflare chat upstream');
+  }
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
   const openAIUpstream = routes.openai;
@@ -694,15 +672,13 @@ export function createProxy(config: ProxyConfig = {}) {
     // Reversibly disguise the configured upstream id for Claude Code's model
     // picker, matching CLIProxyAPI. The id decodes back to the exact provider
     // model on /v1/messages, so discovery and routing cannot drift apart.
-    if (req.method === 'GET' && url.pathname === '/v1/models' && config.chatUpstream !== undefined) {
+    if (req.method === 'GET' && url.pathname === '/v1/models'
+        && config.cloudflareUpstream !== undefined) {
       const configuredModels = config.cloudflareModels?.filter(Boolean) ?? [];
-      const discoveredModel = config.chatModel ?? await config.resolveChatModel?.();
-      const models = (configuredModels.length > 0
-        ? configuredModels
-        : discoveredModel ? [discoveredModel] : []).map((model) => ({
+      const models = configuredModels.map((model) => ({
             id: claudeGatewayModelId(model),
             type: 'model',
-            display_name: chatModelDisplayName(model),
+            display_name: cloudflareModelDisplayName(model),
             created_at: '1970-01-01T00:00:00Z',
           }));
       return new Response(JSON.stringify({
@@ -828,6 +804,7 @@ export function createProxy(config: ProxyConfig = {}) {
     let requestModel: string | undefined;
     let bridgedGptMessages = false;
     let bridgedChatMessages = false;
+    let modelRouteForRequest: 'openai' | 'cloudflare' | undefined;
 
     // Two count_tokens probes on the pre-compression body (see docs/HISTORY_CACHE_MODEL.md):
     //   baselinePromise          → full-body input_tokens
@@ -850,49 +827,24 @@ export function createProxy(config: ProxyConfig = {}) {
         // renderer or Anthropic count_tokens merely because the route is
         // Messages-shaped. Enabled GPT models take the standalone
         // Messages→Responses bridge; unsupported models still fail closed.
-        // chatUpstream defined (OPENAPI_URL, or derived from CLOUDFLARE_ACCOUNT_ID
-        // + CLOUDFLARE_API_TOKEN) → force EVERY Messages request onto it: the
-        // operator declared "this is my endpoint", so routing stops being
-        // name-based entirely. OPENAPI_MODEL is optional on top and only stamps
-        // the outgoing model id (below) — that is what lets Claude Code keep
-        // showing "Opus" while all traffic actually goes to Kimi/etc. Without
-        // it, the client-sent model name is forwarded verbatim.
-        const decodedChatModel = resolveClaudeGatewayModelId(model);
+        // Claude Code model aliases decode back to exact Cloudflare model IDs.
+        const decodedByAlias = [...modelRoutes.keys()]
+          .find((candidate) => claudeGatewayModelId(candidate) === model);
+        const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
         const routedModel = decodedChatModel ?? model;
         const modelRoute = routedModel ? modelRoutes.get(routedModel) : undefined;
-        // OPENAPI_URL historically forced all Messages requests. Preserve that
-        // behavior only when no explicit model routing scope is configured.
-        const forceChat = isMessages && config.chatUpstream !== undefined
-          && (modelRoute === 'cloudflare' || (!scopedRouting && modelRoute === undefined));
+        modelRouteForRequest = modelRoute;
+        const forceChat = isMessages && modelRoute === 'cloudflare';
         const messagesAnthropic = isMessages
-          && (modelRoute === 'anthropic' || (modelRoute === undefined && !forceChat && isClaudeModel(model)));
-        // No chat upstream configured → name-based routing. The Responses
-        // bridge is only for GPT/Grok-SHAPED names: PXPIPE_MODELS is one scope
-        // for all families, so scope membership alone would misroute a listed
-        // Kimi model here; anything else fails closed to passthrough.
+          && modelRoute === undefined && !forceChat && isClaudeModel(model);
+        // Provider routing is explicit. Unlisted Messages models use the
+        // default Anthropic route, regardless of how their id is shaped.
         bridgedGptMessages =
           isMessages && !messagesAnthropic && !forceChat
-          && (modelRoute === 'openai'
-            || (modelRoute === undefined && isGptResponsesModel(model) && isPxpipeSupportedGptModel(model)));
-        // Messages → Chat Completions bridge toward chatUpstream (e.g. Kimi via
-        // Cloudflare Workers AI). Kimi is an unvalidated imaged reader, so this
-        // path never compresses — it is a pure wire-format bridge (modelOk
-        // stays false → compress:false below).
+          && modelRoute === 'openai';
+        // Messages → Chat Completions bridge toward Cloudflare Workers AI.
         bridgedChatMessages = forceChat;
-        // Model to stamp on the bridged chat request: explicit OPENAPI_MODEL
-        // wins; otherwise, when the client sent a Claude-shaped name, ask the
-        // lazy resolver (Cloudflare account catalog, cached). Non-Claude
-        // client ids still forward verbatim so the exact upstream model can
-        // be chosen from the client side.
-        const chatStamp = bridgedChatMessages
-          ? scopedRouting
-            ? routedModel
-            : config.chatModel ??
-              routedModel ??
-              (isClaudeModel(model) && config.resolveChatModel !== undefined
-                ? await config.resolveChatModel()
-                : undefined)
-          : undefined;
+        const chatStamp = bridgedChatMessages ? routedModel : undefined;
         const effectiveModel = chatStamp ?? model;
         const modelOk = isMessages
           ? (messagesAnthropic && isPxpipeSupportedModel(model))
@@ -982,9 +934,10 @@ export function createProxy(config: ProxyConfig = {}) {
         if (name.toLowerCase().startsWith('anthropic-')) anthropicHeaders.push(name);
       });
       for (const name of anthropicHeaders) outHeaders.delete(name);
-      // The chat bridge authenticates against chatUpstream (OPENAPI_API); the GPT
-      // bridge and canonical OpenAI paths use the OpenAI key.
-      const bridgeKey = bridgedChatMessages ? config.chatApiKey : config.openAIApiKey;
+      // The chat bridge uses the Cloudflare token; Responses uses the OpenAI key.
+      const bridgeKey = bridgedChatMessages
+        ? config.cloudflareApiKey
+        : config.openAIApiKey;
       if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
     } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
       outHeaders.set('x-api-key', config.apiKey);
@@ -995,13 +948,13 @@ export function createProxy(config: ProxyConfig = {}) {
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
-    // The chat bridge forwards to the configured chatUpstream at its
+    // The chat bridge forwards to the configured Cloudflare upstream at its
     // /chat/completions endpoint (chatCompletionsUrl normalizes a bare base,
     // a /v1 base, or a full …/chat/completions URL). Every other route appends
     // a path to its resolved base.
     let upstreamUrl: string;
     if (bridgedChatMessages) {
-      upstreamUrl = chatCompletionsUrl(config.chatUpstream ?? '');
+      upstreamUrl = chatCompletionsUrl(config.cloudflareUpstream ?? '');
     } else {
       const outPath = bridgedGptMessages
         ? (routes.stripOpenAIV1 ? '/responses' : '/v1/responses')

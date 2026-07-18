@@ -2,10 +2,8 @@
  * Anthropic Messages wire compatibility for OpenAI Chat Completions upstreams.
  *
  * Lets Claude Code (which only speaks the Anthropic /v1/messages schema) drive
- * any OpenAI-compatible chat-completions endpoint — e.g. Kimi via Cloudflare
- * Workers AI, Moonshot, OpenRouter, Groq, Together. The target endpoint and key
- * are supplied by the host (OPENAPI_URL / OPENAPI_API); this module is pure wire
- * translation and knows nothing about the provider.
+ * Kimi through Cloudflare's OpenAI-compatible Chat Completions endpoint. This
+ * module is pure wire translation and contains no credentials.
  *
  * Mirrors messages-responses-bridge.ts, but targets /v1/chat/completions rather
  * than the Responses API.
@@ -578,95 +576,4 @@ export function chatCompletionsUrl(base: string): string {
   if (/\/chat\/completions$/.test(b)) return b;
   if (/\/v\d+$/.test(b)) return `${b}/chat/completions`;
   return `${b}/v1/chat/completions`;
-}
-
-/** Resolve the OpenAI-compatible chat upstream + bearer key from env inputs.
- *  Explicit OPENAPI_URL/OPENAPI_API always win. Otherwise, if a Cloudflare
- *  account id AND API token are both present, derive the Workers AI endpoint so
- *  Kimi (etc.) works with zero extra config. The Cloudflare token is only paired
- *  with the derived Cloudflare endpoint — never a user-supplied OPENAPI_URL. */
-export function resolveChatUpstream(env: {
-  openapiUrl?: string;
-  openapiApi?: string;
-  cloudflareAccountId?: string;
-  cloudflareApiToken?: string;
-}): { chatUpstream: string | undefined; chatApiKey: string | undefined } {
-  const explicitUrl = env.openapiUrl?.trim() || undefined;
-  const explicitKey = env.openapiApi?.trim() || undefined;
-  const account = env.cloudflareAccountId?.trim();
-  const token = env.cloudflareApiToken?.trim();
-  const cloudflareBase = account && token
-    ? `https://api.cloudflare.com/client/v4/accounts/${account}/ai/v1`
-    : undefined;
-  return {
-    chatUpstream: explicitUrl || cloudflareBase,
-    chatApiKey: explicitKey || (explicitUrl ? undefined : token),
-  };
-}
-
-/** Model stamped on bridged chat requests when the account catalog doesn't
- *  surface a usable OpenAI-compatible Kimi model. Matches the Cloudflare
- *  OpenAI-compat chat/completions example (model: moonshotai/kimi-k3). */
-export const DEFAULT_CHAT_MODEL = 'moonshotai/kimi-k3';
-
-/** Pick the best chat model from an account's model catalog. Only considers
- *  partner-catalog Kimi models — legacy Workers AI "@cf/…" builds are never
- *  auto-selected because they reject the full OpenAI chat schema (400 on
- *  system/tool role messages). Among candidates: general builds over "-code"
- *  variants, then the newest version (numeric-aware descending sort). */
-export function pickChatModel(names: string[]): string | undefined {
-  const kimi = names.filter((n) => /kimi/i.test(n) && !n.startsWith('@cf/'));
-  if (kimi.length === 0) return undefined;
-  const rank = (n: string) => (/-code$/i.test(n) ? 1 : 0);
-  return [...kimi].sort(
-    (a, b) => rank(a) - rank(b) || b.localeCompare(a, undefined, { numeric: true }),
-  )[0];
-}
-
-/** Lazily discover which model to stamp on bridged requests by asking the
- *  Cloudflare account what it exposes (ai/models/search). Success (including
- *  "no Kimi in catalog") is cached for the process lifetime; network failures
- *  are NOT cached, so a transient error retries on the next request. Built
- *  only when the operator provided Cloudflare creds without OPENAPI_MODEL. */
-export function makeCloudflareModelResolver(opts: {
-  accountId: string;
-  apiToken: string;
-  log?: (msg: string) => void;
-  fetchImpl?: typeof fetch;
-}): () => Promise<string | undefined> {
-  let cached: Promise<string | undefined> | undefined;
-  const doFetch = opts.fetchImpl ?? fetch;
-  return () => {
-    cached ??= (async () => {
-      const url =
-        `https://api.cloudflare.com/client/v4/accounts/${opts.accountId}` +
-        `/ai/models/search?search=kimi&per_page=100`;
-      const res = await doFetch(url, {
-        headers: { authorization: `Bearer ${opts.apiToken}` },
-      });
-      if (!res.ok) throw new Error(`models/search → HTTP ${res.status}`);
-      const json = (await res.json()) as { result?: Array<{ name?: string }> };
-      const names = (json.result ?? [])
-        .map((m) => m.name)
-        .filter((n): n is string => typeof n === 'string');
-      const picked = pickChatModel(names);
-      if (picked !== undefined) {
-        opts.log?.(`auto-selected Cloudflare model → ${picked} (override with OPENAPI_MODEL)`);
-        return picked;
-      }
-      opts.log?.(
-        `no OpenAI-compatible Kimi model in catalog (${names.length} entries); ` +
-          `defaulting to ${DEFAULT_CHAT_MODEL} (override with OPENAPI_MODEL)`,
-      );
-      return DEFAULT_CHAT_MODEL;
-    })().catch((err: unknown) => {
-      cached = undefined; // transient failure — retry on the next request
-      opts.log?.(
-        `model auto-discovery failed (${err instanceof Error ? err.message : String(err)}); ` +
-          `using ${DEFAULT_CHAT_MODEL} for this request`,
-      );
-      return DEFAULT_CHAT_MODEL;
-    });
-    return cached;
-  };
 }

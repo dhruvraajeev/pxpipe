@@ -1,10 +1,8 @@
 /**
  * Messages -> Chat Completions bridge (TDD).
  *
- * Pins the wire translation that lets Claude Code drive any OpenAI-compatible
- * chat-completions endpoint (e.g. Kimi via Cloudflare Workers AI) using only the
- * Anthropic /v1/messages schema it speaks. Host supplies OPENAPI_URL/OPENAPI_API;
- * this module is pure translation and knows nothing about the provider.
+ * Pins the wire translation that lets Claude Code drive Kimi through
+ * Cloudflare's OpenAI-compatible endpoint using the Anthropic schema it speaks.
  *
  * Run just this file:  pnpm vitest run tests/chat-bridge.test.ts
  */
@@ -14,9 +12,6 @@ import {
   openAIChatToAnthropicMessage,
   openAIChatStreamToAnthropic,
   chatCompletionsUrl,
-  resolveChatUpstream,
-  pickChatModel,
-  makeCloudflareModelResolver,
 } from '../src/core/messages-chat-bridge.js';
 
 const enc = (obj: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(obj));
@@ -496,7 +491,7 @@ describe('openAIChatStreamToAnthropic — SSE translation', () => {
   });
 });
 
-describe('anthropicMessagesToOpenAIChat — model override (OPENAPI_MODEL)', () => {
+describe('anthropicMessagesToOpenAIChat — model override', () => {
   it('stamps the override model id, replacing the client-sent claude-* id', () => {
     const out = dec(
       anthropicMessagesToOpenAIChat(
@@ -521,141 +516,5 @@ describe('anthropicMessagesToOpenAIChat — model override (OPENAPI_MODEL)', () 
       ),
     );
     expect(out.model).toBe('kimi-k3');
-  });
-});
-
-describe('resolveChatUpstream — zero-config Cloudflare derivation', () => {
-  it('derives the Workers AI /v1 base + bearer from account id + token alone', () => {
-    const { chatUpstream, chatApiKey } = resolveChatUpstream({
-      cloudflareAccountId: 'acct123',
-      cloudflareApiToken: 'tok_secret',
-    });
-    expect(chatUpstream).toBe('https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1');
-    expect(chatApiKey).toBe('tok_secret');
-  });
-
-  it('lets an explicit OPENAPI_URL win over the derived Cloudflare endpoint', () => {
-    const { chatUpstream, chatApiKey } = resolveChatUpstream({
-      openapiUrl: 'https://api.moonshot.ai/v1',
-      openapiApi: 'sk-moon',
-      cloudflareAccountId: 'acct123',
-      cloudflareApiToken: 'tok_secret',
-    });
-    expect(chatUpstream).toBe('https://api.moonshot.ai/v1');
-    expect(chatApiKey).toBe('sk-moon');
-  });
-
-  it('does not pair the Cloudflare token with an explicit OPENAPI_URL', () => {
-    const { chatApiKey } = resolveChatUpstream({
-      openapiUrl: 'https://api.moonshot.ai/v1',
-      cloudflareAccountId: 'acct123',
-      cloudflareApiToken: 'tok_secret',
-    });
-    expect(chatApiKey).toBeUndefined();
-  });
-
-  it('needs BOTH account id and token to derive (either alone → no upstream)', () => {
-    expect(resolveChatUpstream({ cloudflareAccountId: 'acct123' }).chatUpstream).toBeUndefined();
-    expect(resolveChatUpstream({ cloudflareApiToken: 'tok_secret' }).chatUpstream).toBeUndefined();
-  });
-
-  it('trims whitespace and treats blank env values as absent', () => {
-    const { chatUpstream, chatApiKey } = resolveChatUpstream({
-      openapiUrl: '   ',
-      cloudflareAccountId: '  acct123  ',
-      cloudflareApiToken: '  tok_secret  ',
-    });
-    expect(chatUpstream).toBe('https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1');
-    expect(chatApiKey).toBe('tok_secret');
-  });
-});
-
-describe('pickChatModel', () => {
-  it('never auto-selects legacy @cf/ Workers AI builds', () => {
-    expect(
-      pickChatModel(['@cf/moonshotai/kimi-k2.6', '@cf/moonshotai/kimi-k2-instruct']),
-    ).toBeUndefined();
-  });
-
-  it('prefers the partner-catalog model over legacy @cf/ entries', () => {
-    expect(
-      pickChatModel(['@cf/moonshotai/kimi-k2.6', 'moonshotai/kimi-k3']),
-    ).toBe('moonshotai/kimi-k3');
-  });
-
-  it('prefers general Kimi builds over -code variants', () => {
-    expect(pickChatModel(['moonshotai/kimi-k3-code', 'moonshotai/kimi-k3'])).toBe(
-      'moonshotai/kimi-k3',
-    );
-  });
-
-  it('picks the newest version numerically (k3 > k2.6, k2.10 > k2.6)', () => {
-    expect(pickChatModel(['moonshotai/kimi-k2.6', 'moonshotai/kimi-k3'])).toBe(
-      'moonshotai/kimi-k3',
-    );
-    expect(pickChatModel(['moonshotai/kimi-k2.6', 'moonshotai/kimi-k2.10'])).toBe(
-      'moonshotai/kimi-k2.10',
-    );
-  });
-
-  it('returns undefined when no usable Kimi model exists', () => {
-    expect(pickChatModel(['@cf/meta/llama-4'])).toBeUndefined();
-    expect(pickChatModel([])).toBeUndefined();
-  });
-});
-
-describe('makeCloudflareModelResolver', () => {
-  const catalogResponse = (names: string[]) =>
-    ({
-      ok: true,
-      status: 200,
-      json: async () => ({ result: names.map((name) => ({ name })) }),
-    }) as unknown as Response;
-
-  it('discovers the partner model from the account catalog and caches it', async () => {
-    let calls = 0;
-    const resolve = makeCloudflareModelResolver({
-      accountId: 'acct123',
-      apiToken: 'tok_secret',
-      fetchImpl: async (url, init) => {
-        calls++;
-        expect(String(url)).toBe(
-          'https://api.cloudflare.com/client/v4/accounts/acct123/ai/models/search?search=kimi&per_page=100',
-        );
-        expect((init?.headers as Record<string, string>).authorization).toBe('Bearer tok_secret');
-        return catalogResponse(['@cf/moonshotai/kimi-k2.6', 'moonshotai/kimi-k3']);
-      },
-    });
-    expect(await resolve()).toBe('moonshotai/kimi-k3');
-    expect(await resolve()).toBe('moonshotai/kimi-k3');
-    expect(calls).toBe(1); // cached — one catalog fetch for the process lifetime
-  });
-
-  it('falls back to moonshotai/kimi-k3 when the catalog has no usable model', async () => {
-    const resolve = makeCloudflareModelResolver({
-      accountId: 'acct123',
-      apiToken: 'tok_secret',
-      fetchImpl: async () => catalogResponse(['@cf/moonshotai/kimi-k2.6', '@cf/meta/llama-4']),
-    });
-    expect(await resolve()).toBe('moonshotai/kimi-k3'); // never a legacy @cf/ pick
-  });
-
-  it('uses the default on failures without caching them, and caches success', async () => {
-    let calls = 0;
-    const resolve = makeCloudflareModelResolver({
-      accountId: 'acct123',
-      apiToken: 'tok_secret',
-      fetchImpl: async () => {
-        calls++;
-        if (calls === 1) throw new Error('network down');
-        if (calls === 2) return { ok: false, status: 500 } as unknown as Response;
-        return catalogResponse([]);
-      },
-    });
-    expect(await resolve()).toBe('moonshotai/kimi-k3'); // throw → default, not cached
-    expect(await resolve()).toBe('moonshotai/kimi-k3'); // HTTP 500 → default, not cached
-    expect(await resolve()).toBe('moonshotai/kimi-k3'); // empty catalog → default, cached
-    expect(await resolve()).toBe('moonshotai/kimi-k3');
-    expect(calls).toBe(3);
   });
 });

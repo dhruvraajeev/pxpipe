@@ -123,17 +123,6 @@ export function isGrokModel(model: string | null | undefined): boolean {
   return (model ?? '').toLowerCase().startsWith('grok-');
 }
 
-/** Name-shaped test for models that speak the OpenAI *Responses* API
- *  (GPT/o-series/codex, plus Grok's OpenAI-compatible surface). Routing must
- *  be name-based here: PXPIPE_MODELS is one scope shared by every family, so
- *  "allowed" alone cannot tell a GPT entry from a Kimi one. Anything not
- *  name-matched (Kimi, DeepSeek, …) falls through to the Chat Completions
- *  bridge / passthrough instead of being forced onto the Responses bridge. */
-export function isGptResponsesModel(model: string | null | undefined): boolean {
-  const m = (model ?? '').toLowerCase();
-  return m.startsWith('gpt-') || m.startsWith('codex') || /^o\d/.test(m) || isGrokModel(m);
-}
-
 /** Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel
  *  across several page sizes (768x336 → 268, 764x980 → 748, etc.). */
 export const GROK_TOKENS_PER_MEGAPIXEL = 1000;

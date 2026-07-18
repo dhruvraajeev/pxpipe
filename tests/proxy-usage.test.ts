@@ -190,6 +190,7 @@ describe('proxy usage extraction', () => {
     const proxy = createProxy({
       upstream: 'http://anthropic.test', apiKey: 'sk-anthropic',
       openAIUpstream: 'https://api.openai.test', openAIApiKey: 'sk-openai',
+      openAIModels: ['gpt-5.6-sol'],
       transform: { charsPerToken: 1, minCompressChars: 1 },
       onRequest: (e) => { captured = e; },
     });
@@ -294,6 +295,7 @@ describe('proxy usage extraction', () => {
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
       openAIUpstream: 'https://api.openai.test', openAIApiKey: 'sk-stream',
+      openAIModels: ['gpt-5.6-sol'],
       transform: { compress: false }, onRequest: (e) => { captured = e; },
     });
     const res = await proxy(new Request('http://localhost/v1/messages', {
@@ -335,7 +337,7 @@ describe('proxy usage extraction', () => {
         usage: { input_tokens: 1, output_tokens: 1 },
       }), { headers: { 'content-type': 'application/json' } });
     });
-    const proxy = createProxy({ openAIUpstream: 'https://api.openai.test', transform: { compress: false } });
+    const proxy = createProxy({ openAIUpstream: 'https://api.openai.test', openAIModels: ['gpt-5.6-sol'], transform: { compress: false } });
     await (await proxy(new Request('http://localhost/v1/messages', {
       method: 'POST', headers: {
         'content-type': 'application/json', authorization: 'Bearer anthropic-secret',
@@ -371,9 +373,9 @@ describe('proxy usage extraction', () => {
       }), { headers: { 'content-type': 'application/json' } });
     });
     const proxy = createProxy({
-      chatUpstream: 'https://api.cloudflare.test/ai/v1',
-      chatApiKey: 'cf-test',
-      chatModel: 'moonshotai/kimi-k3',
+      cloudflareUpstream: 'https://api.cloudflare.test/ai/v1',
+      cloudflareApiKey: 'cf-test',
+      cloudflareModels: ['moonshotai/kimi-k3'],
       transform: { compress: false },
     });
     const response = await proxy(new Request('http://localhost/v1/messages', {
@@ -425,7 +427,7 @@ describe('proxy usage extraction', () => {
       called = true;
       return new Response('{}');
     });
-    const proxy = createProxy({ openAIUpstream: 'https://openai.test', transform: { compress: false } });
+    const proxy = createProxy({ openAIUpstream: 'https://openai.test', openAIModels: ['gpt-5.6-sol'], transform: { compress: false } });
     const res = await proxy(new Request('http://localhost/v1/messages', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -463,7 +465,7 @@ describe('proxy usage extraction', () => {
     expect(requests.some((request) => request.url.includes('/v1/responses'))).toBe(false);
   });
 
-  it('routes a scope-listed Kimi model to chatUpstream, not the Responses bridge', async () => {
+  it('routes a scope-listed Kimi model to Cloudflare, not the Responses bridge', async () => {
     // Scope alone must not classify a model as GPT: kimi is listed here, yet
     // it has to take the Chat Completions bridge because its NAME is not
     // GPT/Grok-shaped. Regression for the shared-PXPIPE_MODELS routing hole.
@@ -480,7 +482,8 @@ describe('proxy usage extraction', () => {
     });
     const proxy = createProxy({
       openAIUpstream: 'https://openai.test',
-      chatUpstream: 'https://kimi.test/v1', chatApiKey: 'tok_kimi',
+      cloudflareUpstream: 'https://kimi.test/v1', cloudflareApiKey: 'tok_kimi',
+      cloudflareModels: ['moonshotai/kimi-k3'],
       transform: { compress: false },
     });
     const res = await proxy(new Request('http://localhost/v1/messages', {
@@ -505,8 +508,8 @@ describe('proxy usage extraction', () => {
 
   it('advertises a reversible Claude-safe id for gateway model discovery', async () => {
     const proxy = createProxy({
-      chatUpstream: 'https://kimi.test/v1',
-      resolveChatModel: async () => 'moonshotai/kimi-k3',
+      cloudflareUpstream: 'https://kimi.test/v1',
+      cloudflareModels: ['moonshotai/kimi-k3'],
     });
     const res = await proxy(new Request('http://localhost/v1/models?limit=1000'));
     expect(res.status).toBe(200);
@@ -523,8 +526,8 @@ describe('proxy usage extraction', () => {
     });
   });
 
-  it('returns an empty discovery list when a generic chat upstream has no configured model', async () => {
-    const proxy = createProxy({ chatUpstream: 'https://chat.test/v1' });
+  it('returns an empty discovery list when Cloudflare has no configured model', async () => {
+    const proxy = createProxy({ cloudflareUpstream: 'https://chat.test/v1' });
     expect(await (await proxy(new Request('http://localhost/v1/models'))).json()).toEqual({
       data: [], has_more: false, first_id: '', last_id: '',
     });
@@ -544,8 +547,8 @@ describe('proxy usage extraction', () => {
       }), { headers: { 'content-type': 'application/json' } });
     });
     const proxy = createProxy({
-      chatUpstream: 'https://kimi.test/v1',
-      resolveChatModel: async () => 'moonshotai/kimi-k3',
+      cloudflareUpstream: 'https://kimi.test/v1',
+      cloudflareModels: ['moonshotai/kimi-k3'],
       transform: { compress: true, minCompressChars: 1 },
       onRequest: (event) => { captured = event; },
     });
@@ -567,7 +570,7 @@ describe('proxy usage extraction', () => {
     expect(captured?.info?.reason).not.toBe('unsupported_model');
   });
 
-  it('decodes the selected gateway id without consulting model discovery', async () => {
+  it('decodes the selected gateway id to the configured Cloudflare model', async () => {
     let sentModel = '';
     const restore = mockUpstream(async (req) => {
       sentModel = JSON.parse(await req.text()).model;
@@ -577,8 +580,8 @@ describe('proxy usage extraction', () => {
       }), { headers: { 'content-type': 'application/json' } });
     });
     const proxy = createProxy({
-      chatUpstream: 'https://chat.test/v1',
-      resolveChatModel: async () => { throw new Error('must not run'); },
+      cloudflareUpstream: 'https://chat.test/v1',
+      cloudflareModels: ['moonshotai/kimi-k3'],
       transform: { compress: false },
     });
     await (await proxy(new Request('http://localhost/v1/messages', {
@@ -592,46 +595,14 @@ describe('proxy usage extraction', () => {
     expect(sentModel).toBe('moonshotai/kimi-k3');
   });
 
-  it('routes ALL Messages traffic to chatUpstream once it is configured', async () => {
-    // OPENAPI_URL (or the Cloudflare-derived URL) declares "this is my
-    // endpoint": routing stops being name-based, so GPT-named and even
-    // claude-named requests bridge to chatUpstream instead of the Responses
-    // bridge / Anthropic passthrough. Model ids forward verbatim because no
-    // chatModel (OPENAPI_MODEL) override is set.
-    const seen: Request[] = [];
-    const restore = mockUpstream((req) => {
-      seen.push(req.clone());
-      return new Response(JSON.stringify({
-        id: 'chatcmpl_2', model: 'whatever',
-        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 3, completion_tokens: 1 },
-      }), { headers: { 'content-type': 'application/json' } });
-    });
-    const proxy = createProxy({
-      openAIUpstream: 'https://openai.test',
-      chatUpstream: 'https://kimi.test/v1', chatApiKey: 'tok_kimi',
-      transform: { compress: false },
-    });
-    for (const model of ['gpt-5.6-sol', 'claude-fable-5']) {
-      await (await proxy(new Request('http://localhost/v1/messages', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] }),
-      }))).text();
-    }
-    restore();
-    expect(seen).toHaveLength(2);
-    for (const req of seen) expect(req.url).toBe('https://kimi.test/v1/chat/completions');
-    const sentModels = await Promise.all(seen.map(async (req) => JSON.parse(await req.text()).model));
-    expect(sentModels).toEqual(['gpt-5.6-sol', 'claude-fable-5']);
-  });
-
-  it('routes Messages requests by explicit provider model scopes', async () => {
+  it('routes OpenAI, Cloudflare, and Anthropic simultaneously', async () => {
     const seen: Request[] = [];
     const restore = mockUpstream(async (req) => {
       seen.push(req.clone());
       if (req.url.includes('/chat/completions')) {
+        const model = JSON.parse(await req.clone().text()).model;
         return new Response(JSON.stringify({
-          id: 'chatcmpl_scoped', model: 'moonshotai/kimi-k3',
+          id: 'chatcmpl_scoped', model,
           choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
           usage: { prompt_tokens: 1, completion_tokens: 1 },
         }), { headers: { 'content-type': 'application/json' } });
@@ -650,14 +621,15 @@ describe('proxy usage extraction', () => {
     const proxy = createProxy({
       upstream: 'https://anthropic.test',
       openAIUpstream: 'https://openai.test',
-      chatUpstream: 'https://cloudflare.test/ai/v1',
-      chatModel: 'legacy-global-override',
-      anthropicModels: ['custom-claude'],
+      cloudflareUpstream: 'https://cloudflare.test/ai/v1',
+      cloudflareApiKey: 'tok_cf',
       openAIModels: ['custom-codex'],
       cloudflareModels: ['moonshotai/kimi-k3'],
       transform: { compress: false },
     });
-    for (const model of ['custom-claude', 'custom-codex', 'moonshotai/kimi-k3']) {
+    for (const model of [
+      'claude-fable-5', 'custom-codex', 'moonshotai/kimi-k3',
+    ]) {
       await (await proxy(new Request('http://localhost/v1/messages', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
@@ -666,21 +638,37 @@ describe('proxy usage extraction', () => {
     restore();
     expect(seen.some((req) => req.url === 'https://anthropic.test/v1/messages')).toBe(true);
     expect(seen.some((req) => req.url === 'https://openai.test/v1/responses')).toBe(true);
-    const cloudflareRequest = seen.find((req) => req.url.includes('/chat/completions'))!;
+    const cloudflareRequest = seen.find((req) => req.url.includes('cloudflare.test'))!;
     expect(cloudflareRequest.url).toBe('https://cloudflare.test/ai/v1/chat/completions');
+    expect(cloudflareRequest.headers.get('authorization')).toBe('Bearer tok_cf');
     expect(JSON.parse(await cloudflareRequest.text()).model).toBe('moonshotai/kimi-k3');
   });
 
-  it('rejects overlapping provider model scopes', () => {
-    expect(() => createProxy({
-      anthropicModels: ['shared-model'],
-      openAIModels: ['shared-model'],
-    })).toThrow('model shared-model is configured for both anthropic and openai');
+  it('gives Cloudflare precedence over OpenAI for overlapping model scopes', async () => {
+    let upstream = '';
+    const restore = mockUpstream((req) => {
+      upstream = req.url;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      }), { headers: { 'content-type': 'application/json' } });
+    });
+    const proxy = createProxy({
+      openAIModels: ['shared/model'],
+      cloudflareModels: ['shared/model'],
+      cloudflareUpstream: 'https://cloudflare.test/ai/v1',
+      transform: { compress: false },
+    });
+    await (await proxy(new Request('http://localhost/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'shared/model', messages: [{ role: 'user', content: 'hi' }] }),
+    }))).text();
+    restore();
+    expect(upstream).toBe('https://cloudflare.test/ai/v1/chat/completions');
   });
 
-  it('requires a chat upstream when Cloudflare models are scoped', () => {
+  it('requires the Cloudflare scope to have a Cloudflare upstream', () => {
     expect(() => createProxy({ cloudflareModels: ['moonshotai/kimi-k3'] }))
-      .toThrow('cloudflareModels requires a Cloudflare or OPENAPI chat upstream');
+      .toThrow('cloudflareModels requires a Cloudflare chat upstream');
   });
 
   it('correlates interleaved parallel tool deltas and recovers sparse terminal calls', async () => {
@@ -699,7 +687,7 @@ describe('proxy usage extraction', () => {
       ], usage: { input_tokens: 4, output_tokens: 2 } } }],
     ].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify({ type: event, ...(data as object) })}\n\n`).join('');
     const restore = mockUpstream(() => new Response(events, { headers: { 'content-type': 'text/event-stream' } }));
-    const proxy = createProxy({ openAIUpstream: 'https://openai.test', transform: { compress: false } });
+    const proxy = createProxy({ openAIUpstream: 'https://openai.test', openAIModels: ['gpt-5.6-sol'], transform: { compress: false } });
     const out = await (await proxy(new Request('http://localhost/v1/messages', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'gpt-5.6-sol', stream: true, messages: [{ role: 'user', content: 'go' }] }),
@@ -728,7 +716,7 @@ describe('proxy usage extraction', () => {
       } }],
     ].map(([event, data]) => `event: ${event}\rdata: ${JSON.stringify({ type: event, ...(data as object) })}\r\r`).join('');
     const restore = mockUpstream(() => new Response(events, { headers: { 'content-type': 'text/event-stream' } }));
-    const proxy = createProxy({ openAIUpstream: 'https://openai.test', transform: { compress: false } });
+    const proxy = createProxy({ openAIUpstream: 'https://openai.test', openAIModels: ['gpt-5.6-sol'], transform: { compress: false } });
     const out = await (await proxy(new Request('http://localhost/v1/messages', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'gpt-5.6-sol', stream: true, messages: [{ role: 'user', content: 'go' }] }),
@@ -750,7 +738,7 @@ describe('proxy usage extraction', () => {
       } }],
     ].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify({ type: event, ...(data as object) })}\n\n`).join('');
     const restore = mockUpstream(() => new Response(events, { headers: { 'content-type': 'text/event-stream' } }));
-    const proxy = createProxy({ openAIUpstream: 'https://openai.test', transform: { compress: false } });
+    const proxy = createProxy({ openAIUpstream: 'https://openai.test', openAIModels: ['gpt-5.6-sol'], transform: { compress: false } });
     const out = await (await proxy(new Request('http://localhost/v1/messages', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'gpt-5.6-sol', stream: true, messages: [{ role: 'user', content: 'go' }] }),
@@ -773,7 +761,7 @@ describe('proxy usage extraction', () => {
       });
       return new Response(`event: response.failed\ndata: ${data}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
     });
-    const proxy = createProxy({ openAIUpstream: 'https://openai.test', transform: { compress: false } });
+    const proxy = createProxy({ openAIUpstream: 'https://openai.test', openAIModels: ['gpt-5.6-sol'], transform: { compress: false } });
     const make = (stream: boolean) => new Request('http://localhost/v1/messages', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'gpt-5.6-sol', stream, messages: [{ role: 'user', content: 'go' }] }),
@@ -801,7 +789,7 @@ describe('proxy usage extraction', () => {
         ? new Response(events, { headers: { 'content-type': 'text/event-stream' } })
         : new Response('gateway exploded', { status: 502, headers: { 'content-type': 'text/plain' } });
     });
-    const proxy = createProxy({ openAIUpstream: 'https://openai.test', transform: { compress: false } });
+    const proxy = createProxy({ openAIUpstream: 'https://openai.test', openAIModels: ['gpt-5.6-sol'], transform: { compress: false } });
     const request = (stream: boolean) => new Request('http://localhost/v1/messages', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'gpt-5.6-sol', stream, messages: [{ role: 'user', content: 'go' }] }),

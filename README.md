@@ -66,24 +66,6 @@ normally — pxpipe compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
-Route different models through different providers while keeping one client
-base URL:
-
-```bash
-ANTHROPIC_MODELS=claude-fable-5 \
-OPENAI_MODELS=gpt-5.6-sol \
-CLOUDFLARE_MODELS=moonshotai/kimi-k3 \
-CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... \
-npx pxpipe-proxy
-```
-
-The lists contain comma-separated exact model IDs. Listed models route to the
-corresponding Anthropic Messages, OpenAI Responses, or Cloudflare-compatible
-Chat Completions upstream; overlapping entries fail at startup. Unlisted
-models retain pxpipe's normal family routing, so Claude, OpenCode, and Codex
-can share the proxy. `OPENAPI_URL` and `OPENAPI_API` may replace the derived
-Cloudflare endpoint and token.
-
 ## Offline export (no proxy)
 
 You can render text, files, or diffs to PNG pages without running the proxy or
