@@ -17,6 +17,14 @@ behavioral changes, patch = fixes).
   change (same 5×8 box). Regression-guarded in `tests/render.test.ts`.
 
 ### Known limitations / evidence
+- **Model-level A/B validation (2026-07-19, `claude-fable-5`, direct API):**
+  paired reads of identical seeded fixtures rendered with each atlas
+  (2 arms × 8 pages × 3 reps = 48 reads; base `b754d95` vs this PR `ab063f2`).
+  H/K per-char error 119/252 (47.2%) → 47/252 (18.7%); `K`→`H` confusions
+  42 → 1; paired per-position McNemar exact p = 2.4e-07. No collateral
+  regression: non-H/K error 32.2% → 31.7%, identical-image control pages at
+  run-variance floor. Full write-up in
+  [FINDINGS.md](FINDINGS.md) ("Update (2026-07-19)").
 - Reproduce directly — no fixtures or screenshots needed:
   `npx tsx eval/glyph-matrix/demo-glyph.mts` prints the `K`/`H` bitmaps before
   (stock font) and after (shipped atlas) with their Hamming distance.

@@ -1,10 +1,36 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot) · 2026-07-19 (K/H glyph-surgery model-level A/B)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot)
 **Model scope (current):** Fable 5 only. Sol, Opus, GPT 5.5, and Grok remain explicit opt-ins.
 **Harnesses:** Claude/Opus/Fable: `eval/needle-haystack/` (older receipts preserved from `/tmp/needle_eval`); Sol: `eval/sol-profile/` (raw responses and receipts committed)
+
+---
+
+## Update (2026-07-19) — Spleen 5×8 K/H glyph surgery validated at model level (PR #127)
+
+Paired before/after benchmark of the `K` glyph repaint, read by `claude-fable-5`
+via direct API (`env -u ANTHROPIC_BASE_URL`, pxpipe fully bypassed). Arms: base
+`b754d95295f34772eee385ea5e1bdc62c2f98ee8` (origin/main) vs PR head
+`ab063f268482ef7cb28f88370bf1b2c9780ffa29`. Identical seeded fixtures rendered
+with each atlas: 2 arms × 8 pages × 3 reps = 48 reads; pages 0–5 differ only by
+atlas, control pages 6–7 are byte-identical across arms (per-page sha256
+receipts retained).
+
+| metric (best-assignment alignment, 252 H/K chars per arm) | base | PR #127 |
+|---|---|---|
+| H/K per-char error | 119/252 = **47.2%** [41.1, 53.4] | 47/252 = **18.7%** [14.3, 23.9] |
+| `K`→`H` confusions | **42** | **1** |
+| non-H/K char error | 32.2% [29.6, 34.9] | 31.7% [29.1, 34.4] |
+| control-ID exact match | 5/48 | 5/48 |
+
+Paired per-position McNemar (same gold/page/rep/position): 92 PR-only-correct
+vs 34 base-only-correct, discordant n = 126, **exact two-sided p = 2.4e-07**.
+H/K char accuracy 51.6% → 74.6%. No collateral regression: non-H/K error flat,
+zero `H`→`K` confusions introduced, identical-image controls at run-variance
+floor. Verdict: merge — the surgery fixes exactly the claimed failure mode at
+the model level, not just in atlas Hamming distance.
 
 ---
 
